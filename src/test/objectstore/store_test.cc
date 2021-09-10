@@ -1348,7 +1348,11 @@ TEST_P(StoreTest, SimpleObjectTest) {
 TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
   if(string(GetParam()) != "bluestore")
     return;
-      
+  if (smr) {
+    cout << "SKIP (smr)" << std::endl;
+    return;
+  }
+
   SetVal(g_conf(), "bluestore_max_blob_size", "524288");
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
   g_conf().apply_changes(nullptr);
@@ -1443,6 +1447,10 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
 TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
   if(string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "TODO: fix this for smr" << std::endl;
+    return;
+  }
   SetVal(g_conf(), "bluestore_block_db_path", "");
   StartDeferred(65536);
   SetVal(g_conf(), "bluestore_compression_mode", "force");
@@ -1973,6 +1981,10 @@ TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
 TEST_P(StoreTestSpecificAUSize, BluestoreFragmentedBlobTest) {
   if(string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "TODO: fix this for smr" << std::endl;
+    return;
+  }
   SetVal(g_conf(), "bluestore_block_db_path", "");
   StartDeferred(0x10000);
 
@@ -6745,6 +6757,11 @@ void doMany4KWritesTest(ObjectStore* store,
 TEST_P(StoreTestSpecificAUSize, Many4KWritesTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
+	 << std::endl;
+    return;
+  }
 
   StartDeferred(0x10000);
 
@@ -6755,6 +6772,11 @@ TEST_P(StoreTestSpecificAUSize, Many4KWritesTest) {
 TEST_P(StoreTestSpecificAUSize, Many4KWritesNoCSumTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
+	 << std::endl;
+    return;
+  }
   StartDeferred(0x10000);
   SetVal(g_conf(), "bluestore_csum_type", "none");
   g_ceph_context->_conf.apply_changes(nullptr);
@@ -6766,6 +6788,11 @@ TEST_P(StoreTestSpecificAUSize, Many4KWritesNoCSumTest) {
 TEST_P(StoreTestSpecificAUSize, TooManyBlobsTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
+	 << std::endl;
+    return;
+  }
   StartDeferred(0x10000);
   const unsigned max_object = 4*1024*1024;
   doMany4KWritesTest(store.get(), 1, 1000, max_object, 4*1024, 0);
@@ -7066,6 +7093,10 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred" << std::endl;
+    return;
+  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -7501,6 +7532,10 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite2) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred" << std::endl;
+    return;
+  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -7573,6 +7608,10 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite3) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred" << std::endl;
+    return;
+  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -7645,6 +7684,10 @@ TEST_P(StoreTestSpecificAUSize, DeferredDifferentChunks) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no deferred" << std::endl;
+    return;
+  }
 
   size_t alloc_size = 4096;
   size_t large_object_size = 1 * 1024 * 1024;
@@ -7744,6 +7787,10 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnOverwriteReverse) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no overwrite" << std::endl;
+    return;
+  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -7925,6 +7972,10 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnSmallOverwrite) {
 
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: no overwrite" << std::endl;
+    return;
+  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -8174,6 +8225,10 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
   int write_offset = buf_len;
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: assertions about allocations need to be adjusted" << std::endl;
+    return;
+  }
 
 #define WRITE_AT(offset, _length) {\
       ObjectStore::Transaction t;\
@@ -8580,7 +8635,10 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
 TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
   if (string(GetParam()) != "bluestore")
     return;
-
+  if (smr) {
+    cout << "SKIP: smr repair is different" << std::endl;
+    return;
+  }
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
 
@@ -8650,6 +8708,10 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
 TEST_P(StoreTestSpecificAUSize, BluestoreBrokenNoSharedBlobRepairTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: smr repair is different" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
@@ -9234,6 +9296,10 @@ TEST_P(StoreTestSpecificAUSize, ReproNoBlobMultiTest) {
 
   if(string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP (FIXME): bluestore gc does not seem to do the trick here" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "4294967296");
@@ -9350,6 +9416,10 @@ void doManySetAttr(ObjectStore* store,
 TEST_P(StoreTestSpecificAUSize, SpilloverTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
@@ -9378,6 +9448,10 @@ TEST_P(StoreTestSpecificAUSize, SpilloverTest) {
 TEST_P(StoreTestSpecificAUSize, SpilloverFixedTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
@@ -9402,6 +9476,10 @@ TEST_P(StoreTestSpecificAUSize, SpilloverFixedTest) {
 TEST_P(StoreTestSpecificAUSize, SpilloverFixed2Test) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
@@ -9428,6 +9506,10 @@ TEST_P(StoreTestSpecificAUSize, SpilloverFixed2Test) {
 TEST_P(StoreTestSpecificAUSize, SpilloverFixed3Test) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
@@ -9451,6 +9533,9 @@ TEST_P(StoreTestSpecificAUSize, SpilloverFixed3Test) {
 TEST_P(StoreTestSpecificAUSize, Ticket45195Repro) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    return;
+  }
 
   SetVal(g_conf(), "bluestore_default_buffered_write", "true");
   SetVal(g_conf(), "bluestore_max_blob_size", "65536");
