@@ -1,32 +1,21 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
-/*
- * Ceph - scalable distributed file system
- *
- * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
- *
- * This is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software
- * Foundation.  See file COPYING.
- *
- */
-
 #ifndef CEPH_LOGCLIENT_H
 #define CEPH_LOGCLIENT_H
 
-#include <atomic>
 #include "common/LogEntry.h"
-#include "common/ceph_mutex.h"
 #include "common/ostream_temp.h"
 #include "common/ref.h"
 #include "include/health.h"
+#include "crimson/net/Fwd.h"
+
+#include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/timer.hh>
 
 class LogClient;
 class MLog;
 class MLogAck;
-class Messenger;
-class MonMap;
 class Message;
 struct uuid_d;
 struct Connection;
@@ -39,17 +28,26 @@ namespace logging {
 }
 }
 
-struct clog_targets_conf_t {
-  std::string log_to_monitors;
-  std::string log_to_syslog;
-  std::string log_channels;
-  std::string log_prios;
-  std::string log_to_graylog;
-  std::string log_to_graylog_host;
-  std::string log_to_graylog_port;
-  uuid_d fsid; // only 16B. Simpler as a copy.
-  std::string host;
+template<typename Message> using Ref = boost::intrusive_ptr<Message>;
+namespace crimson::net {
+  class Messenger;
+}
+
+enum class log_flushing_t {
+  NO_FLUSH,
+  FLUSH
 };
+
+int parse_log_client_options(CephContext *cct,
+			     std::map<std::string,std::string> &log_to_monitors,
+			     std::map<std::string,std::string> &log_to_syslog,
+			     std::map<std::string,std::string> &log_channels,
+			     std::map<std::string,std::string> &log_prios,
+			     std::map<std::string,std::string> &log_to_graylog,
+			     std::map<std::string,std::string> &log_to_graylog_host,
+			     std::map<std::string,std::string> &log_to_graylog_port,
+			     uuid_d &fsid,
+			     std::string &host);
 
 /** Manage where we output to and at which priority
  *
@@ -63,12 +61,9 @@ struct clog_targets_conf_t {
 class LogChannel : public OstreamTemp::OstreamTempSink
 {
 public:
-
-  LogChannel(CephContext *cct, LogClient *lc, const std::string &channel);
-  LogChannel(CephContext *cct, LogClient *lc,
-             const std::string &channel,
-             const std::string &facility,
-             const std::string &prio);
+  LogChannel(LogClient *lc, const std::string &channel);
+  LogChannel(LogClient *lc, const std::string &channel,
+             const std::string &facility, const std::string &prio);
 
   OstreamTemp debug() {
     return OstreamTemp(CLOG_DEBUG, this);
@@ -131,10 +126,10 @@ public:
   void set_syslog_facility(const std::string& v) {
     syslog_facility = v;
   }
-  std::string get_log_prio() { return log_prio; }
-  std::string get_log_channel() { return log_channel; }
-  std::string get_syslog_facility() { return syslog_facility; }
-  bool must_log_to_syslog() { return log_to_syslog; }
+  const std::string& get_log_prio() const { return log_prio; }
+  const std::string& get_log_channel() const { return log_channel; }
+  const std::string& get_syslog_facility() const { return syslog_facility; }
+  bool must_log_to_syslog() const { return log_to_syslog; }
   /**
    * Do we want to log to syslog?
    *
@@ -151,40 +146,37 @@ public:
     return (graylog != nullptr);
   }
 
-  typedef std::shared_ptr<LogChannel> Ref;
+  using Ref = seastar::lw_shared_ptr<LogChannel>;
 
   /**
-   * Query the configuration database in conf_cct for configuration
-   * parameters. Pick out the relevant values based on our channel name.
-   * Update the logger configuration based on these values.
+   * update config values from parsed k/v std::map for each config option
    *
-   * Return a collection of configuration strings.
+   * Pick out the relevant value based on our channel.
    */
-  clog_targets_conf_t parse_client_options(CephContext* conf_cct);
+  void update_config(std::map<std::string,std::string> &log_to_monitors,
+		     std::map<std::string,std::string> &log_to_syslog,
+		     std::map<std::string,std::string> &log_channels,
+		     std::map<std::string,std::string> &log_prios,
+		     std::map<std::string,std::string> &log_to_graylog,
+		     std::map<std::string,std::string> &log_to_graylog_host,
+		     std::map<std::string,std::string> &log_to_graylog_port,
+		     uuid_d &fsid,
+		     std::string &host);
 
   void do_log(clog_type prio, std::stringstream& ss);
   void do_log(clog_type prio, const std::string& s);
 
 private:
-  CephContext *cct;
   LogClient *parent;
-  ceph::mutex channel_lock = ceph::make_mutex("LogChannel::channel_lock");
   std::string log_channel;
   std::string log_prio;
   std::string syslog_facility;
   bool log_to_syslog;
   bool log_to_monitors;
-  std::shared_ptr<ceph::logging::Graylog> graylog;
-
-  /**
-   * update config values from parsed k/v std::map for each config option
-   */
-  void update_config(const clog_targets_conf_t& conf_strings);
-
-  clog_targets_conf_t parse_log_client_options(CephContext* conf_cct);
+  seastar::shared_ptr<ceph::logging::Graylog> graylog;
 };
 
-typedef LogChannel::Ref LogChannelRef;
+using LogChannelRef = LogChannel::Ref;
 
 class LogClient
 {
@@ -194,35 +186,22 @@ public:
     FLAG_MON = 0x1,
   };
 
-  LogClient(CephContext *cct, Messenger *m, MonMap *mm,
-          logclient_flag_t flags);
+  LogClient(crimson::net::Messenger *m, logclient_flag_t flags);
 
-  virtual ~LogClient() {
-    channels.clear();
-  }
+  virtual ~LogClient() = default;
 
-  bool handle_log_ack(MLogAck *m);
-  ceph::ref_t<Message> get_mon_log_message(bool flush);
-  bool are_pending();
+  seastar::future<> handle_log_ack(Ref<MLogAck> m);
+  MessageURef get_mon_log_message(log_flushing_t flush_flag);
+  bool are_pending() const;
 
   LogChannelRef create_channel() {
     return create_channel(CLOG_CHANNEL_DEFAULT);
   }
 
-  LogChannelRef create_channel(const std::string& name) {
-    LogChannelRef c;
-    if (channels.count(name))
-      c = channels[name];
-    else {
-      c = std::make_shared<LogChannel>(cct, this, name);
-      channels[name] = c;
-    }
-    return c;
-  }
+  LogChannelRef create_channel(const std::string& name);
 
   void destroy_channel(const std::string& name) {
-    if (channels.count(name))
-      channels.erase(name);
+    channels.erase(name);
   }
 
   void shutdown() {
@@ -230,26 +209,24 @@ public:
   }
 
   uint64_t get_next_seq();
-  entity_addrvec_t get_myaddrs();
-  const EntityName& get_myname();
+  entity_addrvec_t get_myaddrs() const;
+  const EntityName& get_myname() const;
   entity_name_t get_myrank();
   version_t queue(LogEntry &entry);
   void reset();
+  seastar::future<> set_fsid(const uuid_d& fsid);
 
 private:
-  ceph::ref_t<Message> _get_mon_log_message();
-  void _send_to_mon();
+  MessageURef _get_mon_log_message();
 
-  CephContext *cct;
-  Messenger *messenger;
-  MonMap *monmap;
+  crimson::net::Messenger *messenger;
   bool is_mon;
-  ceph::mutex log_lock = ceph::make_mutex("LogClient::log_lock");
   version_t last_log_sent;
   version_t last_log;
   std::deque<LogEntry> log_queue;
 
   std::map<std::string, LogChannelRef> channels;
-
+  uuid_d m_fsid;
 };
 #endif
+
