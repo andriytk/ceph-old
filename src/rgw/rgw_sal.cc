@@ -28,6 +28,10 @@
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
+#ifdef WITH_RADOSGW_MOTR
+#include "rgw_sal_motr.h"
+#endif
+
 
 #define dout_subsys ceph_subsys_rgw
 
