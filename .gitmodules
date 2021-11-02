@@ -22,10 +22,10 @@
 	branch = ceph-release-1.7.x
 [submodule "src/spdk"]
 	path = src/spdk
-	url = https://github.com/ceph/spdk.git
+	url = https://github.com/ceph/spdk
 [submodule "src/xxHash"]
 	path = src/xxHash
-	url = https://github.com/ceph/xxHash.git
+	url = https://github.com/ceph/xxHash
 [submodule "src/isa-l"]
 	path = src/isa-l
 	url = https://github.com/ceph/isa-l
@@ -43,19 +43,19 @@
 	url = https://github.com/ceph/rapidjson
 [submodule "src/dmclock"]
 	path = src/dmclock
-	url = https://github.com/ceph/dmclock.git
+	url = https://github.com/ceph/dmclock
 [submodule "src/seastar"]
 	path = src/seastar
-	url = https://github.com/ceph/seastar.git
+	url = https://github.com/ceph/seastar
 [submodule "src/fmt"]
 	path = src/fmt
-	url = https://github.com/ceph/fmt.git
+	url = https://github.com/ceph/fmt
 [submodule "src/c-ares"]
 	path = src/c-ares
-	url = https://github.com/ceph/c-ares.git
+	url = https://github.com/ceph/c-ares
 [submodule "src/spawn"]
 	path = src/spawn
-	url = https://github.com/ceph/spawn.git
+	url = https://github.com/ceph/spawn
 [submodule "src/pybind/mgr/rook/rook-client-python"]
 	path = src/pybind/mgr/rook/rook-client-python
 	url = https://github.com/ceph/rook-client-python.git
@@ -74,3 +74,6 @@
 	path = src/libkmip
 	url = https://github.com/ceph/libkmip
 	branch = ceph-master
+[submodule "src/s3select"]
+	path = src/s3select
+	url = https://github.com/ceph/s3select
