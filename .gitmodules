@@ -3,11 +3,11 @@
 	url = https://github.com/ceph/ceph-object-corpus
 [submodule "src/erasure-code/jerasure/jerasure"]
 	path = src/erasure-code/jerasure/jerasure
-	url = https://github.com/ceph/jerasure.git
+	url = https://github.com/ceph/jerasure
 	branch = v2-ceph
 [submodule "src/erasure-code/jerasure/gf-complete"]
 	path = src/erasure-code/jerasure/gf-complete
-	url = https://github.com/ceph/gf-complete.git
+	url = https://github.com/ceph/gf-complete
 	branch = v3-ceph
 [submodule "src/rocksdb"]
 	path = src/rocksdb
