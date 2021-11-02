@@ -1,6 +1,6 @@
 [submodule "ceph-object-corpus"]
 	path = ceph-object-corpus
-	url = https://github.com/ceph/ceph-object-corpus.git
+	url = https://github.com/ceph/ceph-object-corpus
 [submodule "src/erasure-code/jerasure/jerasure"]
 	path = src/erasure-code/jerasure/jerasure
 	url = https://github.com/ceph/jerasure.git
@@ -15,7 +15,7 @@
 	ignore = dirty
 [submodule "ceph-erasure-code-corpus"]
 	path = ceph-erasure-code-corpus
-	url = https://github.com/ceph/ceph-erasure-code-corpus.git
+	url = https://github.com/ceph/ceph-erasure-code-corpus
 [submodule "src/googletest"]
 	path = src/googletest
 	url = https://github.com/ceph/googletest
