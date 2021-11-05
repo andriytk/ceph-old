@@ -1347,23 +1347,12 @@ namespace rgw::sal {
 
 extern "C" {
 
-  void *newDBStore(CephContext *cct)
+  void *newMotrStore(CephContext *cct)
   {
     rgw::sal::MotrStore *store = new rgw::sal::MotrStore();
+    // TODO: connect to Motr
     if (store) {
-      MotrStoreManager *dbsm = new MotrStoreManager(cct);
 
-      if (!dbsm ) {
-        delete store; store = nullptr;
-      }
-
-      Motr *db = dbsm->getDB();
-      if (!db) {
-        delete dbsm;
-        delete store; store = nullptr;
-      }
-
-      store->setDBStoreManager(dbsm);
       store->setDB(db);
       db->set_store((rgw::sal::Store*)store);
     }

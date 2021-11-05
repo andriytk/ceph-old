@@ -40,6 +40,9 @@ extern rgw::sal::Store* newStore(void);
 #ifdef WITH_RADOSGW_DBSTORE
 extern rgw::sal::Store* newDBStore(CephContext *cct);
 #endif
+#ifdef WITH_RADOSGW_MOTR
+extern rgw::sal::Store* newMotrStore(CephContext *cct);
+#endif
 }
 
 rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* dpp, CephContext* cct, const std::string svc, bool use_gc_thread, bool use_lc_thread, bool quota_threads, bool run_sync_thread, bool run_reshard_thread, bool use_cache, bool use_gc)
@@ -105,6 +108,30 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
 #endif
   }
 
+  if (svc.compare("m0store") == 0) {
+#ifdef WITH_RADOSGW_MOTR
+    rgw::sal::Store* store = newMotrStore(cct);
+
+    /* Initialize the dbstore with cct & dpp */
+    DB *db = static_cast<rgw::sal::DBStore *>(store)->getDB();
+    db->set_context(cct);
+
+    /* XXX: temporary - create testid user */
+    rgw_user testid_user("", "testid", "");
+    std::unique_ptr<rgw::sal::User> user = store->get_user(testid_user);
+    user->get_info().display_name = "M. Tester";
+    user->get_info().user_email = "tester@ceph.com";
+    RGWAccessKey k1("0555b35654ad1656d804", "h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==");
+    user->get_info().access_keys["0555b35654ad1656d804"] = k1;
+
+    int r = user->store_user(dpp, null_yield, true);
+    if (r < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed inserting testid user in dbstore error r=" << r << dendl;
+    }
+    return store;
+#endif
+  }
+
   return nullptr;
 }
 
@@ -132,6 +159,14 @@ rgw::sal::Store* StoreManager::init_raw_storage_provider(const DoutPrefixProvide
   if (svc.compare("dbstore") == 0) {
 #ifdef WITH_RADOSGW_DBSTORE
     store = newDBStore(cct);
+#else
+    store = nullptr;
+#endif
+  }
+
+  if (svc.compare("m0store") == 0) {
+#ifdef WITH_RADOSGW_MOTR
+    store = newMotrStore(cct);
 #else
     store = nullptr;
 #endif
