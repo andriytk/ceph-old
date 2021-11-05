@@ -432,21 +432,14 @@ protected:
 
   class MotrStore : public Store {
     private:
-      /* MotrStoreManager is used in case multiple
-       * connections are needed one for each tenant.
-       */
-      MotrStoreManager *dbsm;
-      /* default db (single connection). If needed
-       * multiple db handles (for eg., one for each tenant),
-       * use dbsm->getDB(tenant) */
       Motr *db;
       string luarocks_path;
       MotrZone zone;
       RGWSyncModuleInstanceRef sync_module;
 
     public:
-      MotrStore(): dbsm(nullptr), zone(this) {}
-      ~MotrStore() { delete dbsm; }
+      MotrStore(): zone(this) {}
+      ~MotrStore() { ; }
 
       virtual std::unique_ptr<User> get_user(const rgw_user& u) override;
       virtual int get_user_by_access_key(const DoutPrefixProvider *dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user) override;
@@ -569,13 +562,8 @@ protected:
       }
 
       /* Unique to MotrStore */
-      void setDBStoreManager(MotrStoreManager *stm) { dbsm = stm; }
-      MotrStoreManager *getDBStoreManager(void) { return dbsm; }
-
       void setDB(Motr * st) { db = st; }
       Motr *getDB(void) { return db; }
-
-      Motr *getDB(string tenant) { return dbsm->getDB(tenant, false); }
   };
 
 } } // namespace rgw::sal
