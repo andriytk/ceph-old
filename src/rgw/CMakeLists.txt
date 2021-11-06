@@ -254,6 +254,15 @@ if(WITH_RADOSGW_DBSTORE)
   target_link_libraries(rgw_common PRIVATE global dbstore)
 endif()
 
+if(WITH_RADOSGW_MOTR)
+  target_include_directories(rgw_common PRIVATE "/usr/include/motr")
+  target_compile_options(rgw_common
+    PRIVATE "-Wno-attributes" "-include" "motr/config.h")
+  target_compile_definitions(rgw_common
+    PRIVATE "M0_EXTERN=extern" "M0_INTERNAL=")
+  target_link_libraries(rgw_common PRIVATE "motr")
+endif()
+
 set(rgw_a_srcs
   rgw_auth_keystone.cc
   rgw_client_io.cc
