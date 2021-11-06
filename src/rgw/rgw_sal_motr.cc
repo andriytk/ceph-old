@@ -19,6 +19,10 @@
 #include <unistd.h>
 #include <sstream>
 
+#include "lib/types.h"
+#include "lib/trace.h"   // m0_trace_set_mmapped_buffer
+#include "motr/layout.h" // M0_OBJ_LAYOUT_ID
+
 #include "common/Clock.h"
 #include "common/errno.h"
 
@@ -1351,11 +1355,6 @@ extern "C" {
   {
     rgw::sal::MotrStore *store = new rgw::sal::MotrStore();
     // TODO: connect to Motr
-    if (store) {
-
-      store->setDB(db);
-      db->set_store((rgw::sal::Store*)store);
-    }
 
     return store;
   }

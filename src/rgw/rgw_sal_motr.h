@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "motr/client.h"
+
 #include "rgw_sal.h"
 #include "rgw_oidc_provider.h"
 #include "rgw_role.h"
@@ -432,7 +434,11 @@ protected:
 
   class MotrStore : public Store {
     private:
-      Motr *db;
+      struct m0_client   *m0_inst;
+      struct m0_container container;
+      struct m0_realm     uber_realm;
+      struct m0_config    conf = {};
+      struct m0_idx_dix_config dix_conf = {};
       string luarocks_path;
       MotrZone zone;
       RGWSyncModuleInstanceRef sync_module;
@@ -561,9 +567,6 @@ protected:
         luarocks_path = path;
       }
 
-      /* Unique to MotrStore */
-      void setDB(Motr * st) { db = st; }
-      Motr *getDB(void) { return db; }
   };
 
 } } // namespace rgw::sal
