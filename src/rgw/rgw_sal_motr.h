@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "motr/config.h"
 #include "motr/client.h"
 
@@ -66,7 +68,7 @@ protected:
       virtual int complete_flush_stats(const DoutPrefixProvider *dpp, optional_yield y) override;
       virtual int read_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, uint32_t max_entries,
           bool* is_truncated, RGWUsageIter& usage_iter,
-          map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+          std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
       virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) override;
 
       /* Placeholders */
@@ -162,7 +164,7 @@ protected:
       virtual int try_refresh_info(const DoutPrefixProvider *dpp, ceph::real_time *pmtime) override;
       virtual int read_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, uint32_t max_entries,
           bool *is_truncated, RGWUsageIter& usage_iter,
-          map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+          std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
       virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) override;
       virtual int remove_objs_from_index(const DoutPrefixProvider *dpp, std::list<rgw_obj_index_key>& objs_to_unlink) override;
       virtual int check_index(const DoutPrefixProvider *dpp, std::map<RGWObjCategory, RGWStorageStats>& existing_stats, std::map<RGWObjCategory, RGWStorageStats>& calculated_stats) override;
@@ -178,7 +180,7 @@ protected:
 				const string& delim,
 				const int& max_uploads,
 				vector<std::unique_ptr<MultipartUpload>>& uploads,
-				map<string, bool> *common_prefixes,
+				std::map<string, bool> *common_prefixes,
 				bool *is_truncated) override;
       virtual int abort_multiparts(const DoutPrefixProvider *dpp,
 				 CephContext *cct,
@@ -484,10 +486,10 @@ protected:
       virtual RGWLC* get_rgwlc(void) override { return NULL; }
       virtual RGWCoroutinesManagerRegistry* get_cr_registry() override { return NULL; }
 
-      virtual int log_usage(const DoutPrefixProvider *dpp, map<rgw_user_bucket, RGWUsageBatch>& usage_info) override;
+      virtual int log_usage(const DoutPrefixProvider *dpp, std::map<rgw_user_bucket, RGWUsageBatch>& usage_info) override;
       virtual int log_op(const DoutPrefixProvider *dpp, std::string& oid, bufferlist& bl) override;
       virtual int register_to_service_map(const DoutPrefixProvider *dpp, const string& daemon_type,
-          const map<string, string>& meta) override;
+          const std::map<string, string>& meta) override;
       virtual void get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota) override;
       virtual int set_buckets_enabled(const DoutPrefixProvider *dpp, vector<rgw_bucket>& buckets, bool enabled) override;
       virtual uint64_t get_new_req_id() override { return 0; }
@@ -498,12 +500,12 @@ protected:
           optional_yield y) override;
       virtual RGWDataSyncStatusManager* get_data_sync_manager(const rgw_zone_id& source_zone) override;
       virtual void wakeup_meta_sync_shards(set<int>& shard_ids) override { return; }
-      virtual void wakeup_data_sync_shards(const DoutPrefixProvider *dpp, const rgw_zone_id& source_zone, map<int, set<string> >& shard_ids) override { return; }
+      virtual void wakeup_data_sync_shards(const DoutPrefixProvider *dpp, const rgw_zone_id& source_zone, std::map<int, set<string> >& shard_ids) override { return; }
       virtual int clear_usage(const DoutPrefixProvider *dpp) override { return 0; }
       virtual int read_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch,
           uint32_t max_entries, bool *is_truncated,
           RGWUsageIter& usage_iter,
-          map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+          std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
       virtual int trim_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) override;
       virtual int get_config_key_val(std::string name, bufferlist* bl) override;
       virtual int meta_list_keys_init(const DoutPrefixProvider *dpp, const std::string& section, const std::string& marker, void** phandle) override;
