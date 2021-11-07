@@ -17,8 +17,12 @@
 
 #include <string>
 #include <map>
+#include <vector>
+#include <set>
 using std::string;
 using std::map;
+using std::vector;
+using std::set;
 
 #include "motr/config.h"
 #include "motr/client.h"
