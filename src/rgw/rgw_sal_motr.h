@@ -19,10 +19,12 @@
 #include <map>
 #include <vector>
 #include <set>
+#include <list>
 using std::string;
 using std::map;
 using std::vector;
 using std::set;
+using std::list;
 
 #include "motr/config.h"
 #include "motr/client.h"
