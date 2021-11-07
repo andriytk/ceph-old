@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "motr/config.h"
 #include "motr/client.h"
 
 #include "rgw_sal.h"
@@ -272,8 +273,6 @@ protected:
         private:
           MotrObject* source;
           RGWObjectCtx* rctx;
-          Motr::Object op_target;
-          Motr::Object::Read parent_op;
 
         public:
           MotrReadOp(MotrObject *_source, RGWObjectCtx *_rctx);
@@ -288,8 +287,6 @@ protected:
         private:
           MotrObject* source;
           RGWObjectCtx* rctx;
-          Motr::Object op_target;
-          Motr::Object::Delete parent_op;
 
         public:
           MotrDeleteOp(MotrObject* _source, RGWObjectCtx* _rctx);
@@ -384,7 +381,7 @@ protected:
       virtual int omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::string& key, bufferlist& val,
           bool must_exist, optional_yield y) override;
     private:
-      int read_attrs(const DoutPrefixProvider* dpp, Motr::Object::Read &read_op, optional_yield y, rgw_obj* target_obj = nullptr);
+      //int read_attrs(const DoutPrefixProvider* dpp, Motr::Object::Read &read_op, optional_yield y, rgw_obj* target_obj = nullptr);
   };
 
   class MotrAtomicWriter : public Writer {
@@ -395,8 +392,6 @@ protected:
 	uint64_t olh_epoch;
 	const std::string& unique_tag;
     MotrObject obj;
-    Motr::Object op_target;
-    Motr::Object::Write parent_op;
     uint64_t total_data_size = 0; /* for total data being uploaded */
     bufferlist head_data;
     bufferlist tail_part_data;
@@ -434,6 +429,7 @@ protected:
 
   class MotrStore : public Store {
     private:
+      CephContext *cctx;
       struct m0_client   *m0_inst;
       struct m0_container container;
       struct m0_realm     uber_realm;
@@ -444,7 +440,7 @@ protected:
       RGWSyncModuleInstanceRef sync_module;
 
     public:
-      MotrStore(): zone(this) {}
+      MotrStore(CephContext *c): cctx(c), zone(this) {}
       ~MotrStore() { ; }
 
       virtual std::unique_ptr<User> get_user(const rgw_user& u) override;
@@ -556,7 +552,7 @@ protected:
       virtual void finalize(void) override;
 
       virtual CephContext *ctx(void) override {
-        return db->ctx();
+        return cctx;
       }
 
       virtual const std::string& get_luarocks_path() const override {

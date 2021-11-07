@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sstream>
 
+#include "motr/config.h"
 #include "lib/types.h"
 #include "lib/trace.h"   // m0_trace_set_mmapped_buffer
 #include "motr/layout.h" // M0_OBJ_LAYOUT_ID
@@ -1353,8 +1354,10 @@ extern "C" {
 
   void *newMotrStore(CephContext *cct)
   {
-    rgw::sal::MotrStore *store = new rgw::sal::MotrStore();
-    // TODO: connect to Motr
+    rgw::sal::MotrStore *store = new rgw::sal::MotrStore(cct);
+    if (store) {
+      // TODO: connect to Motr
+    }
 
     return store;
   }

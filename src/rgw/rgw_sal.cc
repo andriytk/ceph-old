@@ -28,8 +28,11 @@
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
+
 #ifdef WITH_RADOSGW_MOTR
+extern "C" {
 #include "rgw_sal_motr.h"
+}
 #endif
 
 
