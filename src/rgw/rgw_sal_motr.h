@@ -440,17 +440,18 @@ protected:
 
   class MotrStore : public Store {
     private:
-      CephContext *cctx;
-      struct m0_client   *m0_inst;
-      struct m0_container container;
-      struct m0_realm     uber_realm;
-      struct m0_config    conf = {};
-      struct m0_idx_dix_config dix_conf = {};
       string luarocks_path;
       MotrZone zone;
       RGWSyncModuleInstanceRef sync_module;
 
     public:
+      CephContext *cctx;
+      struct m0_client   *instance;
+      struct m0_container container;
+      struct m0_realm     uber_realm;
+      struct m0_config    conf = {};
+      struct m0_idx_dix_config dix_conf = {};
+
       MotrStore(CephContext *c): cctx(c), zone(this) {}
       ~MotrStore() { ; }
 
