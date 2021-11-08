@@ -1304,11 +1304,42 @@ extern "C" {
 
   void *newMotrStore(CephContext *cct)
   {
+    int rc = -1;
     rgw::sal::MotrStore *store = new rgw::sal::MotrStore(cct);
+
     if (store) {
-      // TODO: connect to Motr
+      store->conf.mc_is_oostore     = true;
+      // XXX: these params should be taken from config settings and
+      // cct somehow?
+      store->conf.mc_local_addr     = "192.168.180.182@tcp:12345:4:1";
+      store->conf.mc_ha_addr        = "192.168.180.182@tcp:12345:1:1";
+      store->conf.mc_profile        = "0x7000000000000001:0x4f";
+      store->conf.mc_process_fid    = "0x7200000000000001:0x29";
+      store->conf.mc_tm_recv_queue_min_len =    64;
+      store->conf.mc_max_rpc_msg_size      = 65536;
+      store->conf.mc_idx_service_id  = M0_IDX_DIX;
+      store->dix_conf.kc_create_meta = false;
+      store->conf.mc_idx_service_conf = &store->dix_conf;
+
+      rc = m0_client_init(&store->instance, &store->conf, true);
+      if (rc != 0) {
+	ldout(cct, 0) << "ERROR: m0_client_init() failed: " << rc << dendl;
+	goto out;
+      }
+
+      m0_container_init(&store->container, nullptr, &M0_UBER_REALM, store->instance);
+      rc = store->container.co_realm.re_entity.en_sm.sm_rc;
+      if (rc != 0) {
+	ldout(cct, 0) << "ERROR: m0_container_init() failed: " << rc << dendl;
+	goto out;
+      }
     }
 
+out:
+    if (rc != 0) {
+      delete store;
+      return nullptr;
+    }
     return store;
   }
 
