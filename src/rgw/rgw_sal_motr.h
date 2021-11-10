@@ -53,7 +53,9 @@ protected:
 
   class MotrUser : public User {
     private:
-      MotrStore *store;
+      MotrStore         *store;
+      struct m0_uint128  idxID;
+      struct m0_idx     *idx;
 
     public:
       MotrUser(MotrStore *_st, const rgw_user& _u) : User(_u), store(_st) { }
@@ -575,6 +577,7 @@ protected:
         luarocks_path = path;
       }
 
+      int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
   };
 
 } } // namespace rgw::sal

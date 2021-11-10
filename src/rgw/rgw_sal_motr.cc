@@ -1298,6 +1298,33 @@ namespace rgw::sal {
     return 0;
   }
 
+  int MotrStore::open_idx(struct m0_uint128 *id, bool create, struct m0_idx *idx)
+  {
+    m0_idx_init(idx, &container.co_realm, id);
+
+    if (!create)
+      return 0; // nothing to do more
+
+    // create index or make sure it's created
+    struct m0_op *op;
+    int rc = m0_entity_create(NULL, &idx->in_entity, &op);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
+      goto out;
+    }
+
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    if (rc != 0 && rc != -EEXIST)
+      ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
+ out:
+    return rc;
+  }
+
 } // namespace rgw::sal
 
 extern "C" {
