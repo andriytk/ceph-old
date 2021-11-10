@@ -107,11 +107,16 @@ namespace rgw::sal {
   {
 //    int ret = store->getDB()->get_user(dpp, string("user_id"), "", info, &attrs,
 //        &objv_tracker);
+    vector<uint8_t> key, val;
+
     int rc = store->open_idx(&idxID, true, &idx);
     if (rc != 0) {
       ldout(store->cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
       goto out;
     }
+
+    key.assign(info.user_id.id.begin(), info.user_id.id.end());
+    rc = store->do_idx_op(&idx, M0_IC_GET, key, val);
 
   out:
     m0_idx_fini(&idx);
@@ -1332,15 +1337,15 @@ namespace rgw::sal {
     return rc;
   }
 
-  static void set_m0bufvec(struct m0_bufvec *bv, vector<byte> *vec)
+  static void set_m0bufvec(struct m0_bufvec *bv, vector<uint8_t>& vec)
   {
-    *bv->ov_buf = reinterpret_cast<char*>(vec->data());
-    *bv->ov_vec.v_count = vec->size();
+    *bv->ov_buf = reinterpret_cast<char*>(vec.data());
+    *bv->ov_vec.v_count = vec.size();
   }
 
   // idx must be opened with open_idx() beforehand
   int MotrStore::do_idx_op(struct m0_idx *idx, enum m0_idx_opcode opcode,
-                           vector<byte> *key, vector<byte> *val, bool update)
+                           vector<uint8_t>& key, vector<uint8_t>& val, bool update)
   {
     int rc, rc_i;
     struct m0_bufvec k, v, *vp = &v;
@@ -1393,8 +1398,8 @@ namespace rgw::sal {
     }
 
     if (opcode == M0_IC_GET) {
-      val->resize(*v.ov_vec.v_count);
-      memcpy(reinterpret_cast<char*>(val->data()), *v.ov_buf, *v.ov_vec.v_count);
+      val.resize(*v.ov_vec.v_count);
+      memcpy(reinterpret_cast<char*>(val.data()), *v.ov_buf, *v.ov_vec.v_count);
     }
 
   out:
