@@ -107,8 +107,15 @@ namespace rgw::sal {
   {
 //    int ret = store->getDB()->get_user(dpp, string("user_id"), "", info, &attrs,
 //        &objv_tracker);
+    int rc = store->open_idx(&idxID, true, &idx);
+    if (rc != 0) {
+      ldout(store->cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+      goto out;
+    }
 
-    return 0;
+  out:
+    m0_idx_fini(&idx);
+    return rc;
   }
 
   int MotrUser::store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info)
@@ -1321,10 +1328,84 @@ namespace rgw::sal {
 
     if (rc != 0 && rc != -EEXIST)
       ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
- out:
+  out:
     return rc;
   }
 
+  static void set_m0bufvec(struct m0_bufvec *bv, vector<byte> *vec)
+  {
+    *bv->ov_buf = reinterpret_cast<char*>(vec->data());
+    *bv->ov_vec.v_count = vec->size();
+  }
+
+  // idx must be opened with open_idx() beforehand
+  int MotrStore::do_idx_op(struct m0_idx *idx, enum m0_idx_opcode opcode,
+                           vector<byte> *key, vector<byte> *val, bool update)
+  {
+    int rc, rc_i;
+    struct m0_bufvec k, v, *vp = &v;
+    uint32_t flags = 0;
+    struct m0_op *op;
+
+    if (m0_bufvec_empty_alloc(&k, 1) != 0) {
+      ldout(cctx, 0) << "ERROR: failed to allocate key bufvec" << dendl;
+      return -ENOMEM;
+    }
+
+    if (opcode == M0_IC_PUT || opcode == M0_IC_GET) {
+      rc = -ENOMEM;
+      if (m0_bufvec_empty_alloc(&v, 1) != 0) {
+        ldout(cctx, 0) << "ERROR: failed to allocate value bufvec" << dendl;
+        goto out;
+      }
+    }
+
+    set_m0bufvec(&k, key);
+    if (opcode == M0_IC_PUT)
+      set_m0bufvec(&v, val);
+
+    if (opcode == M0_IC_DEL)
+      vp = NULL;
+
+    if (opcode == M0_IC_PUT && update)
+      flags |= M0_OIF_OVERWRITE;
+
+    rc = m0_idx_op(idx, opcode, &k, vp, &rc_i, flags, &op);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: failed to init index op: " << rc << dendl;
+      goto out;
+    }
+
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: op failed: " << rc << dendl;
+      goto out;
+    }
+
+    if (rc_i != 0) {
+      ldout(cctx, 0) << "ERROR: idx op failed: " << rc_i << dendl;
+      goto out;
+    }
+
+    if (opcode == M0_IC_GET) {
+      val->resize(*v.ov_vec.v_count);
+      memcpy(reinterpret_cast<char*>(val->data()), *v.ov_buf, *v.ov_vec.v_count);
+    }
+
+  out:
+    m0_bufvec_free2(&k);
+    if (opcode == M0_IC_GET)
+      m0_bufvec_free(&v); // cleanup buffer after GET
+    else if (opcode == M0_IC_PUT)
+      m0_bufvec_free2(&v);
+
+    return rc;
+  }
 } // namespace rgw::sal
 
 extern "C" {

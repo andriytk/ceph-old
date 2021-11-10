@@ -25,6 +25,7 @@ using std::map;
 using std::vector;
 using std::set;
 using std::list;
+using std::byte;
 
 #include "motr/config.h"
 #include "motr/client.h"
@@ -54,8 +55,8 @@ protected:
   class MotrUser : public User {
     private:
       MotrStore         *store;
-      struct m0_uint128  idxID;
-      struct m0_idx     *idx;
+      struct m0_uint128  idxID = {0xe5ecb53640d4ecce, 0x6a156cd5a74aa3b8}; // MD5 of “motr.rgw.users“
+      struct m0_idx      idx;
 
     public:
       MotrUser(MotrStore *_st, const rgw_user& _u) : User(_u), store(_st) { }
@@ -578,6 +579,8 @@ protected:
       }
 
       int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
+      int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
+		    vector<byte> *key, vector<byte> *val, bool update);
   };
 
 } } // namespace rgw::sal
