@@ -25,7 +25,6 @@ using std::map;
 using std::vector;
 using std::set;
 using std::list;
-using std::byte;
 
 #include "motr/config.h"
 #include "motr/client.h"
@@ -455,7 +454,7 @@ protected:
       struct m0_config    conf = {};
       struct m0_idx_dix_config dix_conf = {};
 
-      MotrStore(CephContext *c): cctx(c), zone(this) {}
+      MotrStore(CephContext *c): zone(this), cctx(c) {}
       ~MotrStore() { ; }
 
       virtual std::unique_ptr<User> get_user(const rgw_user& u) override;
@@ -580,7 +579,7 @@ protected:
 
       int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
       int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
-		    vector<byte> *key, vector<byte> *val, bool update);
+		    vector<uint8_t>& key, vector<uint8_t>& val, bool update = false);
   };
 
 } } // namespace rgw::sal
