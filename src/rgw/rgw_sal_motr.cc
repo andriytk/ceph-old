@@ -111,7 +111,7 @@ namespace rgw::sal {
 
     int rc = store->open_idx(&idxID, true, &idx);
     if (rc != 0) {
-      ldout(store->cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+      ldpp_dout(dpp, 0) << "ERROR: failed to open index: " << rc << dendl;
       goto out;
     }
 
@@ -121,19 +121,40 @@ namespace rgw::sal {
       bufferlist bl;
       bl.append(reinterpret_cast<char*>(val.data()), val.size());
       auto iter = bl.cbegin();
-      decode(info, iter);
+      try {
+        decode(info, iter);
+      } catch (buffer::error& err) {
+        ldpp_dout(dpp, 0) << "ERROR: failed to decode user info" << dendl;
+        rc = -EIO;
+      }
     }
 
   out:
-    m0_idx_fini(&idx);
+    store->close_idx(&idx);
     return rc;
   }
 
   int MotrUser::store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info)
   {
     //int ret = store->getDB()->store_user(dpp, info, exclusive, &attrs, &objv_tracker, old_info);
+    vector<uint8_t> key, val;
+    bufferlist bl;
 
-    return 0;
+    int rc = store->open_idx(&idxID, true, &idx);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to open index: " << rc << dendl;
+      goto out;
+    }
+
+    key.assign(info.user_id.id.begin(), info.user_id.id.end());
+    encode(info, bl);
+    val.assign(reinterpret_cast<uint8_t*>(bl.c_str()),
+               reinterpret_cast<uint8_t*>(bl.c_str() + bl.length()));
+    rc = store->do_idx_op(&idx, M0_IC_PUT, key, val);
+
+  out:
+    store->close_idx(&idx);
+    return rc;
   }
 
   int MotrUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)

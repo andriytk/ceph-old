@@ -578,6 +578,7 @@ protected:
       }
 
       int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
+      void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }
       int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
 		    vector<uint8_t>& key, vector<uint8_t>& val, bool update = false);
   };
