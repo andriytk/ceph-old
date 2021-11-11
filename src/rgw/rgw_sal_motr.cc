@@ -103,33 +103,45 @@ namespace rgw::sal {
     return 0;
   }
 
+  // m0_idx must be open already
+  static int get_user(const DoutPrefixProvider *dpp, MotrStore *store,
+                      struct m0_idx *idx, RGWUserInfo& info, RGWObjVersionTracker& objv)
+  {
+    vector<uint8_t> key, val;
+
+    key.assign(info.user_id.id.begin(), info.user_id.id.end());
+    int rc = store->do_idx_op(idx, M0_IC_GET, key, val);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: GET idx op failed: " << rc << dendl;
+      return rc;
+    }
+
+    bufferlist bl;
+    bl.append(reinterpret_cast<char*>(val.data()), val.size());
+    auto iter = bl.cbegin();
+    try {
+      decode(info, iter);
+      decode(objv.read_version, iter);
+    } catch (buffer::error& err) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to decode user info" << dendl;
+      rc = -EIO;
+    }
+
+    return rc;
+  }
+
   int MotrUser::load_user(const DoutPrefixProvider *dpp, optional_yield y)
   {
 //    int ret = store->getDB()->get_user(dpp, string("user_id"), "", info, &attrs,
 //        &objv_tracker);
-    vector<uint8_t> key, val;
-
     int rc = store->open_idx(&idxID, true, &idx);
     if (rc != 0) {
       ldpp_dout(dpp, 0) << "ERROR: failed to open index: " << rc << dendl;
-      goto out;
+      return rc;
     }
 
-    key.assign(info.user_id.id.begin(), info.user_id.id.end());
-    rc = store->do_idx_op(&idx, M0_IC_GET, key, val);
-    if (rc == 0) {
-      bufferlist bl;
-      bl.append(reinterpret_cast<char*>(val.data()), val.size());
-      auto iter = bl.cbegin();
-      try {
-        decode(info, iter);
-      } catch (buffer::error& err) {
-        ldpp_dout(dpp, 0) << "ERROR: failed to decode user info" << dendl;
-        rc = -EIO;
-      }
-    }
+    rc = get_user(dpp, store, &idx, info, objv_tracker);
 
-  out:
     store->close_idx(&idx);
     return rc;
   }
@@ -139,6 +151,9 @@ namespace rgw::sal {
     //int ret = store->getDB()->store_user(dpp, info, exclusive, &attrs, &objv_tracker, old_info);
     vector<uint8_t> key, val;
     bufferlist bl;
+    RGWUserInfo orig_info;
+    RGWObjVersionTracker objv = {};
+    obj_version& obj_ver = objv.read_version;
 
     int rc = store->open_idx(&idxID, true, &idx);
     if (rc != 0) {
@@ -146,12 +161,39 @@ namespace rgw::sal {
       goto out;
     }
 
+    // Check if the user already exists
+    orig_info.user_id = info.user_id;
+    rc = get_user(dpp, store, &idx, orig_info, objv);
+    if (rc == 0 && obj_ver.ver > 0) {
+      if (old_info)
+        *old_info = orig_info;
+
+      if (objv_tracker.read_version.ver != obj_ver.ver) {
+        rc = -ECANCELED;
+        ldpp_dout(dpp, 0) << "ERROR: User Read version mismatch" << dendl;
+        goto out;
+      }
+
+      if (exclusive)
+        return rc;
+
+      obj_ver.ver++;
+    } else {
+      obj_ver.ver = 1;
+      obj_ver.tag = "UserTAG";
+    }
+
     key.assign(info.user_id.id.begin(), info.user_id.id.end());
     encode(info, bl);
+    encode(obj_ver, bl);
     val.assign(reinterpret_cast<uint8_t*>(bl.c_str()),
                reinterpret_cast<uint8_t*>(bl.c_str() + bl.length()));
     rc = store->do_idx_op(&idx, M0_IC_PUT, key, val);
 
+    if (rc == 0) {
+      objv_tracker.read_version = obj_ver;
+      objv_tracker.write_version = obj_ver;
+    }
   out:
     store->close_idx(&idx);
     return rc;
