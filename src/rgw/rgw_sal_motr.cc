@@ -117,6 +117,12 @@ namespace rgw::sal {
 
     key.assign(info.user_id.id.begin(), info.user_id.id.end());
     rc = store->do_idx_op(&idx, M0_IC_GET, key, val);
+    if (rc == 0) {
+      bufferlist bl;
+      bl.append(reinterpret_cast<char*>(val.data()), val.size());
+      auto iter = bl.cbegin();
+      decode(info, iter);
+    }
 
   out:
     m0_idx_fini(&idx);
