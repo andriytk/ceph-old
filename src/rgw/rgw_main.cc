@@ -56,9 +56,9 @@
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
-#ifdef WITH_RADOSGW_MOTR
-#include "rgw_sal_motr.h"
-#endif
+//#ifdef WITH_RADOSGW_MOTR
+//#include "rgw_sal_motr.h"
+//#endif
 
 #include "services/svc_zone.h"
 
