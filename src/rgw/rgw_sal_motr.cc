@@ -19,10 +19,12 @@
 #include <unistd.h>
 #include <sstream>
 
+extern "C" {
 #include "motr/config.h"
 #include "lib/types.h"
 #include "lib/trace.h"   // m0_trace_set_mmapped_buffer
 #include "motr/layout.h" // M0_OBJ_LAYOUT_ID
+}
 
 #include "common/Clock.h"
 #include "common/errno.h"
@@ -149,6 +151,12 @@ namespace rgw::sal {
     return rc;
   }
 
+  int MotrUser::create_user_info_idx()
+  {
+    string bucket_index_iname = "motr.rgw.user.info." + info.user_id.id;
+    return store->create_motr_idx_by_name(bucket_index_iname);
+  }
+
   int MotrUser::store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info)
   {
     //int ret = store->getDB()->store_user(dpp, info, exclusive, &attrs, &objv_tracker, old_info);
@@ -232,14 +240,68 @@ namespace rgw::sal {
     return 0;
   }
 
+  int MotrBucket::put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
+  {
+    bufferlist bl;
+    struct MotrBucketInfo mbinfo;
+
+    mbinfo.info = info;
+    mbinfo.bucket_attrs = attrs;
+    //mbinfo.mtime = ;
+    mbinfo.bucket_version = bucket_version;
+    mbinfo.encode(bl);
+
+    // Insert bucket instance using bucket's marker (string).
+    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                           M0_IC_PUT, info.bucket.marker, bl);
+    return rc;
+  }
+
   int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
   {
-    int ret = 0;
+    // Get bucket instance using bucket's marker (string). or bucket id?
+    bufferlist bl;
+    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                           M0_IC_GET, info.bucket.marker, bl);
+    if (rc < 0)
+        return rc;
 
-//    ret = store->getDB()->get_bucket_info(dpp, string("name"), "", info, &attrs,
-//        &mtime, &bucket_version);
+    struct MotrBucketInfo mbinfo;
+    bufferlist& blr = bl;
+    auto iter =blr.cbegin();
+    mbinfo.decode(iter); //Decode into MotrBucketInfo.
+    info = mbinfo.info;
+    attrs = mbinfo.bucket_attrs;
+    mtime = mbinfo.mtime;
+    bucket_version = mbinfo.bucket_version;
 
-    return ret;
+    return rc;
+  }
+
+  int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
+  {
+    bufferlist bl;
+    RGWBucketEntryPoint ep;
+    ep.bucket = info.bucket;
+    ep.owner = new_user->get_id();
+    ep.creation_time = get_creation_time();
+    ep.linked = true;
+    ep.encode(bl);
+
+    // Insert the user into the user info index.
+    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
+    return store->query_motr_idx_by_name(user_info_idx_name,
+                                         M0_IC_PUT, info.bucket.marker, bl);
+
+  }
+
+  int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
+  {
+    // Remove the user into the user info index.
+    bufferlist bl;
+    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
+    return store->query_motr_idx_by_name(user_info_idx_name,
+                                         M0_IC_DEL, info.bucket.marker, bl);
   }
 
   /* stats - Not for first pass */
@@ -249,6 +311,12 @@ namespace rgw::sal {
       std::string *max_marker, bool *syncstopped)
   {
     return 0;
+  }
+
+  int MotrBucket::create_bucket_index()
+  {
+    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.marker;
+    return store->create_motr_idx_by_name(bucket_index_iname);
   }
 
   int MotrBucket::get_bucket_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
@@ -1118,7 +1186,7 @@ namespace rgw::sal {
   int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
       User* u, const rgw_bucket& b,
       const string& zonegroup_id,
-      rgw_placement_rule& placement_rule,
+      rgw_placement_rule& placement_rule, //not applied to Motr
       string& swift_ver_location,
       const RGWQuotaInfo * pquota_info,
       const RGWAccessControlPolicy& policy,
@@ -1132,87 +1200,60 @@ namespace rgw::sal {
       std::unique_ptr<Bucket>* bucket_out,
       optional_yield y)
   {
-//    int ret;
-//    bufferlist in_data;
-//    RGWBucketInfo master_info;
-//    rgw_bucket *pmaster_bucket = nullptr;
-//    uint32_t *pmaster_num_shards = nullptr;
-//    real_time creation_time;
-//    std::unique_ptr<Bucket> bucket;
-//    obj_version objv, *pobjv = NULL;
-//
-//    /* If it exists, look it up; otherwise create it */
-//    ret = get_bucket(dpp, u, b, &bucket, y);
-//    if (ret < 0 && ret != -ENOENT)
-//      return ret;
-//
-//    if (ret != -ENOENT) {
-//      RGWAccessControlPolicy old_policy(ctx());
-//      *existed = true;
-//      if (swift_ver_location.empty()) {
-//        swift_ver_location = bucket->get_info().swift_ver_location;
-//      }
-//      placement_rule.inherit_from(bucket->get_info().placement_rule);
-//
-//      // don't allow changes to the acl policy
-//      /*    int r = rgw_op_get_bucket_policy_from_attr(dpp, this, u, bucket->get_attrs(),
-//            &old_policy, y);
-//            if (r >= 0 && old_policy != policy) {
-//            bucket_out->swap(bucket);
-//            return -EEXIST;
-//            }*/
-//    } else {
-//      bucket = std::make_unique<MotrBucket>(this, b, u);
-//      *existed = false;
-//      bucket->set_attrs(attrs);
-//      // XXX: For now single default zone and STANDARD storage class
-//      // supported.
-//      placement_rule.name = "default";
-//      placement_rule.storage_class = "STANDARD";
-//    }
-//
-//    /*
-//     * XXX: If not master zone, fwd the request to master zone.
-//     * For now MotrStore has single zone.
-//     */
-//    std::string zid = zonegroup_id;
-//    /* if (zid.empty()) {
-//       zid = svc()->zone->get_zonegroup().get_id();
-//       } */
-//
-//    if (*existed) {
-//      rgw_placement_rule selected_placement_rule;
-//      /* XXX: Handle this when zone is implemented
-//         ret = svc()->zone->select_bucket_placement(u.get_info(),
-//         zid, placement_rule,
-//         &selected_placement_rule, nullptr, y);
-//         if (selected_placement_rule != info.placement_rule) {
-//         ret = -EEXIST;
-//         bucket_out->swap(bucket);
-//         return ret;
-//         } */
-//    } else {
-//
-//      /* XXX: We may not need to send all these params. Cleanup the unused ones */
-//      ret = getDB()->create_bucket(dpp, u->get_info(), bucket->get_key(),
-//          zid, placement_rule, swift_ver_location, pquota_info,
-//          attrs, info, pobjv, &ep_objv, creation_time,
-//          pmaster_bucket, pmaster_num_shards, y, exclusive);
-//      if (ret == -EEXIST) {
-//        *existed = true;
-//        ret = 0;
-//      } else if (ret != 0) {
-//        return ret;
-//      }
-//    }
-//
-//    bucket->set_version(ep_objv);
-//    bucket->get_info() = info;
-//
-//    bucket_out->swap(bucket);
-//
-    //return ret;
-    return 0;
+    int ret;
+    bufferlist in_data;
+    RGWBucketInfo master_info;
+    real_time creation_time;
+    std::unique_ptr<Bucket> bucket;
+
+    // Look up the bucket. Create it if it doesn't exist.
+    ret = get_bucket(dpp, u, b, &bucket, y);
+    if (ret < 0 && ret != -ENOENT)
+      return ret;
+
+    if (ret != -ENOENT) {
+      *existed = true;
+      if (swift_ver_location.empty()) {
+        swift_ver_location = bucket->get_info().swift_ver_location;
+      }
+
+      // TODO: ACL policy
+      // // don't allow changes to the acl policy
+      //RGWAccessControlPolicy old_policy(ctx());
+      //int rc = rgw_op_get_bucket_policy_from_attr(
+      //           dpp, this, u, bucket->get_attrs(), &old_policy, y);
+      //if (rc >= 0 && old_policy != policy) {
+      //    bucket_out->swap(bucket);
+      //    return -EEXIST;
+      //}
+    } else {
+      bucket = std::make_unique<MotrBucket>(this, b, u);
+      *existed = false;
+      bucket->set_attrs(attrs);
+    }
+
+    // TODO: how to handle zone and multi-site. 
+
+    if (!*existed) {
+        // Create a new bucket: (1) Add a key/value pair in the
+        // bucket instance index. (2) Create a new bucket index. 
+        MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
+        ret = mbucket->put_bucket_info(dpp, y)? :
+              mbucket->create_bucket_index();
+        if (ret < 0)
+          ldout(cctx, 0) << "ERROR: failed to create bucket instance index! " << ret << dendl;
+
+       // Insert the bucket entry into the user info index.
+       ret = mbucket->link_user(dpp, u, y);
+       if (ret < 0)
+          ldout(cctx, 0) << "ERROR: failed to add bucket entry! " << ret << dendl;
+    }
+
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
+    bucket_out->swap(bucket);
+
+    return ret;
   }
 
   bool MotrStore::is_meta_master()
@@ -1484,6 +1525,107 @@ namespace rgw::sal {
 
     return rc;
   }
+
+  int MotrStore::open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx)
+  {
+    m0_fid_tassume((struct m0_fid *)id, &m0_dix_fid_type);
+    m0_idx_init(idx, &container.co_realm, id);
+
+    return 0;
+  }
+
+  void MotrStore::index_name_to_motr_fid(string iname, struct m0_uint128 *id)
+  {
+    unsigned char md5[16];  // 128/8 = 16
+    MD5 hash;
+
+    // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+    hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+    hash.Update((const unsigned char *)iname.c_str(), iname.length());
+    hash.Final(md5);
+
+    memcpy(&id->u_hi, md5, 8);
+    memcpy(&id->u_lo, md5 + 8, 8);
+    m0_fid_tassume((struct m0_fid*)id, &m0_dix_fid_type);
+  }
+
+  int MotrStore::query_motr_idx_by_name(string idx_name, enum m0_idx_opcode opcode,
+                                        string key_str, bufferlist &bl)
+  {
+    struct m0_idx idx;
+    vector<uint8_t> key(key_str.begin(), key_str.end());
+    vector<uint8_t> val;
+    struct m0_uint128 idx_id;
+
+    index_name_to_motr_fid(idx_name, &idx_id);
+    int rc = open_motr_idx(&idx_id, &idx);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+      goto out;
+    }
+
+    if (opcode == M0_IC_PUT)
+      val.assign(bl.c_str(), bl.c_str() + bl.length());
+
+    rc = do_idx_op(&idx, M0_IC_GET, key, val);
+    if (rc == 0 && opcode == M0_IC_GET)
+      // Append the returned value (blob) to the bufferlist.
+      bl.append(reinterpret_cast<char*>(val.data()), val.size());
+
+  out:
+    m0_idx_fini(&idx);
+    return rc;
+  }
+
+  int MotrStore::create_motr_idx_by_name(string iname)
+  {
+    struct m0_idx idx;
+    struct m0_uint128 id;
+
+    index_name_to_motr_fid(iname, &id);
+    m0_idx_init(&idx, &container.co_realm, &id);
+
+    // create index or make sure it's created
+    struct m0_op *op;
+    int rc = m0_entity_create(NULL, &idx.in_entity, &op);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
+      goto out;
+    }
+
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    if (rc != 0 && rc != -EEXIST)
+      ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
+  out:
+    m0_idx_fini(&idx);
+    return rc;
+  }
+
+  // If a global index is checked (if it has been create) every time
+  // before they're queried (put/get), which takes 2 Motr operations to
+  // complete the query. As the global indices' name and FID are known
+  // already when MotrStore is created, we move the check and creation
+  // in newMotrStore().
+  // Similar method is used for per bucket/user index. For example,
+  // bucket instance index is created when creating the bucket.
+  int MotrStore::check_n_create_global_indices()
+  {
+    int rc = 0;
+
+    for (const auto& iname : motr_global_indices) {
+        rc = create_motr_idx_by_name(iname);
+        if (rc < 0 && rc != -EEXIST)
+          break;
+    }
+
+    return rc;
+  }
+
 } // namespace rgw::sal
 
 extern "C" {
@@ -1520,6 +1662,9 @@ extern "C" {
 	ldout(cct, 0) << "ERROR: m0_container_init() failed: " << rc << dendl;
 	goto out;
       }
+
+      // Create global indices if not yet.
+      store->check_n_create_global_indices();
     }
 
 out:

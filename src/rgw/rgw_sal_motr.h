@@ -26,8 +26,10 @@ using std::vector;
 using std::set;
 using std::list;
 
+extern "C" {
 #include "motr/config.h"
 #include "motr/client.h"
+}
 
 #include "rgw_sal.h"
 #include "rgw_oidc_provider.h"
@@ -36,6 +38,16 @@ using std::list;
 namespace rgw { namespace sal {
 
   class MotrStore;
+
+  // Global Motr indices
+  #define RGW_MOTR_BUCKET_INST_IDX_NAME "motr.rgw.bucket.instances"
+  #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
+  //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
+
+  std::string motr_global_indices[] = {
+    RGW_MOTR_BUCKET_INST_IDX_NAME,
+    RGW_MOTR_BUCKET_HD_IDX_NAME
+  };
 
 class MotrNotification : public Notification {
 protected:
@@ -87,6 +99,8 @@ protected:
       virtual int store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info = nullptr) override;
       virtual int remove_user(const DoutPrefixProvider* dpp, optional_yield y) override;
 
+      int create_user_info_idx();
+
       friend class MotrBucket;
   };
 
@@ -94,6 +108,41 @@ protected:
     private:
       MotrStore *store;
       RGWAccessControlPolicy acls;
+
+    // RGWBucketInfo and other information that are shown when listing a bucket is
+    // represented in struct MotrBucketInfo. The structure is encoded and stored
+    // as the value of the global bucket instance index.
+    // TODO: compare pros and cons of separating the bucket_attrs (ACLs, tag etc.)
+    // into a different index.
+    struct MotrBucketInfo {
+      RGWBucketInfo info;
+
+      obj_version bucket_version;
+      ceph::real_time mtime;
+
+      rgw::sal::Attrs bucket_attrs;
+  
+      void encode(bufferlist& bl)  const
+      {
+        ENCODE_START(4, 4, bl);
+        encode(info, bl);
+        encode(bucket_version, bl);
+        encode(mtime, bl);
+        encode(bucket_attrs, bl); //rgw_cache.h example for a map
+        ENCODE_FINISH(bl); 
+      }
+
+      void decode(bufferlist::const_iterator& bl)
+      {
+        DECODE_START(4, bl);
+        decode(info, bl);
+        decode(bucket_version, bl);
+        decode(mtime, bl);
+        decode(bucket_attrs, bl);
+        DECODE_FINISH(bl); 
+      }
+
+    };
 
     public:
       MotrBucket(MotrStore *_st)
@@ -154,7 +203,11 @@ protected:
 					DoutPrefixProvider *dpp) override;
       virtual RGWAccessControlPolicy& get_acl(void) override { return acls; }
       virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
+      int put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y);
       virtual int get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y) override;
+      int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
+      int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
+      int create_bucket_index();
       virtual int get_bucket_stats(const DoutPrefixProvider *dpp, int shard_id,
           string *bucket_ver, string *master_ver,
           map<RGWObjCategory, RGWStorageStats>& stats,
@@ -581,6 +634,14 @@ protected:
       void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }
       int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
 		    vector<uint8_t>& key, vector<uint8_t>& val, bool update = false);
+ 
+      
+      void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
+      int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
+      int create_motr_idx_by_name(string iname);
+      int query_motr_idx_by_name(string idx_name, enum m0_idx_opcode opcode,
+                                 string key_str, bufferlist &bl);
+      int check_n_create_global_indices();
   };
 
 } } // namespace rgw::sal
