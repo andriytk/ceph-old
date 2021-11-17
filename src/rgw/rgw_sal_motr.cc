@@ -1503,6 +1503,7 @@ extern "C" {
       store->dix_conf.kc_create_meta = false;
       store->conf.mc_idx_service_conf = &store->dix_conf;
 
+      store->instance = NULL;
       rc = m0_client_init(&store->instance, &store->conf, true);
       if (rc != 0) {
 	ldout(cct, 0) << "ERROR: m0_client_init() failed: " << rc << dendl;
