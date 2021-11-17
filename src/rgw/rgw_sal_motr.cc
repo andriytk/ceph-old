@@ -35,6 +35,8 @@
 
 namespace rgw::sal {
 
+  using ::ceph::encode;
+
   int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
       const string& end_marker, uint64_t max, bool need_stats,
       BucketList &buckets, optional_yield y)
@@ -122,6 +124,7 @@ namespace rgw::sal {
     try {
       decode(info, iter);
       decode(objv.read_version, iter);
+      decode(attrs, iter);
     } catch (buffer::error& err) {
       ldpp_dout(dpp, 0) << "ERROR: failed to decode user info" << dendl;
       rc = -EIO;
@@ -186,6 +189,7 @@ namespace rgw::sal {
     key.assign(info.user_id.id.begin(), info.user_id.id.end());
     encode(info, bl);
     encode(obj_ver, bl);
+    encode(attrs, bl);
     val.assign(reinterpret_cast<uint8_t*>(bl.c_str()),
                reinterpret_cast<uint8_t*>(bl.c_str() + bl.length()));
     rc = store->do_idx_op(&idx, M0_IC_PUT, key, val);
