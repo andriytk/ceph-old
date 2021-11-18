@@ -177,6 +177,7 @@ namespace rgw::sal {
       obj_ver.tag = "UserTAG";
     }
 
+    // Insert the user to user info index.
     muinfo.info = info;
     muinfo.attrs = attrs;
     muinfo.user_version = obj_ver;
@@ -188,6 +189,32 @@ namespace rgw::sal {
       objv_tracker.read_version = obj_ver;
       objv_tracker.write_version = obj_ver;
     }
+
+/*
+    // Insert (access_key, user id) into access_key index. Getting the user
+    // info using access key is the first step when processing any s3 operation
+    // (for example bucket creation).
+    //
+    // Motr index only supports querying using key, not value or part of value.
+    // That is why we can't query the user info index using access_key. An auxiliary
+    // index using access_key as the key is created. Querying a user using
+    // access_key is done in 2 steps: (1) get user id (name) by query
+    // access_key index; (2) use the user id to query user info index.
+    // We may need other auxiliary indices.
+    //
+    // This creates a problem for Motr: DTM is needed to make sure the updates
+    // to multiple indices are atomic.
+    bufferlist akbl;
+    akbl.append(info.user_id.id.c_str(), info.user_id.id.length());
+
+    rc = store->query_motr_idx_by_name(RGW_MOTR_USER_ACCESS_KEY_IDX_NAME,
+                                       M0_IC_PUT, info.user_id.id, bl);
+    ldpp_dout(dpp, 0) << "Store user to motr index: rc = " << rc << dendl;
+    if (rc == 0) {
+      objv_tracker.read_version = obj_ver;
+      objv_tracker.write_version = obj_ver;
+    }
+*/
 
     // Create user info index to store all buckets that are belong
     // to this bucket.
@@ -240,18 +267,21 @@ namespace rgw::sal {
     mbinfo.bucket_version = bucket_version;
     mbinfo.encode(bl);
 
-    // Insert bucket instance using bucket's marker (string).
+    // Insert bucket instance using bucket's name (string).
     int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_PUT, info.bucket.marker, bl);
+                                           M0_IC_PUT, info.bucket.name, bl);
     return rc;
   }
 
   int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
   {
-    // Get bucket instance using bucket's marker (string). or bucket id?
+    // Get bucket instance using bucket's name (string). or bucket id?
     bufferlist bl;
+    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket name  = " << info.bucket.name << dendl;
+    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
     int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_GET, info.bucket.marker, bl);
+                                           M0_IC_GET, info.bucket.name, bl);
+    ldpp_dout(dpp, 0) << "get_bucket_info(): rc  = " << rc << dendl;
     if (rc < 0)
         return rc;
 
@@ -280,7 +310,7 @@ namespace rgw::sal {
     // Insert the user into the user info index.
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
     return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_PUT, info.bucket.marker, bl);
+                                         M0_IC_PUT, info.bucket.name, bl);
 
   }
 
@@ -290,7 +320,7 @@ namespace rgw::sal {
     bufferlist bl;
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
     return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_DEL, info.bucket.marker, bl);
+                                         M0_IC_DEL, info.bucket.name, bl);
   }
 
   /* stats - Not for first pass */
@@ -304,7 +334,7 @@ namespace rgw::sal {
 
   int MotrBucket::create_bucket_index()
   {
-    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.marker;
+    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
     return store->create_motr_idx_by_name(bucket_index_iname);
   }
 
@@ -1076,24 +1106,24 @@ namespace rgw::sal {
 
   int MotrStore::get_user_by_access_key(const DoutPrefixProvider *dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user)
   {
-//    RGWUserInfo uinfo;
-//    User *u;
-//    int ret = 0;
-//    RGWObjVersionTracker objv_tracker;
-//
-//    ret = getDB()->get_user(dpp, string("access_key"), key, uinfo, nullptr,
-//        &objv_tracker);
-//
-//    if (ret < 0)
-//      return ret;
-//
-//    u = new MotrUser(this, uinfo);
-//
-//    if (!u)
-//      return -ENOMEM;
-//
-//    u->get_version_tracker() = objv_tracker;
-//    user->reset(u);
+    RGWUserInfo uinfo;
+    User *u;
+    RGWObjVersionTracker objv_tracker;
+
+    /* Hard code user info for test. */
+    rgw_user testid_user("tenant", "tester", "ns");
+    uinfo.user_id = testid_user;
+    uinfo.display_name = "Motr Explorer";
+    uinfo.user_email = "tester@seagate.com";
+    RGWAccessKey k1("0555b35654ad1656d804", "h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==");
+    uinfo.access_keys["0555b35654ad1656d804"] = k1;
+
+    u = new MotrUser(this, uinfo);
+    if (!u)
+      return -ENOMEM;
+
+    u->get_version_tracker() = objv_tracker;
+    user->reset(u);
 
     return 0;
   }
