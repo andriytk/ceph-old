@@ -26,8 +26,10 @@ using std::vector;
 using std::set;
 using std::list;
 
+extern "C" {
 #include "motr/config.h"
 #include "motr/client.h"
+}
 
 #include "rgw_sal.h"
 #include "rgw_oidc_provider.h"
@@ -36,6 +38,43 @@ using std::list;
 namespace rgw { namespace sal {
 
   class MotrStore;
+
+  // Global Motr indices
+  #define RGW_MOTR_USERS_IDX_NAME   "motr.rgw.users"
+  #define RGW_MOTR_BUCKET_INST_IDX_NAME "motr.rgw.bucket.instances"
+  #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
+  //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
+
+  std::string motr_global_indices[] = {
+    RGW_MOTR_USERS_IDX_NAME,
+    RGW_MOTR_BUCKET_INST_IDX_NAME,
+    RGW_MOTR_BUCKET_HD_IDX_NAME
+  };
+
+  struct MotrUserInfo {
+    RGWUserInfo info;
+    obj_version user_version;
+    rgw::sal::Attrs attrs;
+
+    void encode(bufferlist& bl)  const
+    {
+      ENCODE_START(3, 3, bl);
+      encode(info, bl);
+      encode(user_version, bl);
+      encode(attrs, bl);
+      ENCODE_FINISH(bl);
+    }
+
+    void decode(bufferlist::const_iterator& bl)
+    {
+      DECODE_START(3, bl);
+      decode(info, bl);
+      decode(user_version, bl);
+      decode(attrs, bl);
+      DECODE_FINISH(bl);
+    }
+  };
+  WRITE_CLASS_ENCODER(MotrUserInfo);
 
 class MotrNotification : public Notification {
 protected:
@@ -87,6 +126,8 @@ protected:
       virtual int store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info = nullptr) override;
       virtual int remove_user(const DoutPrefixProvider* dpp, optional_yield y) override;
 
+      int create_user_info_idx();
+
       friend class MotrBucket;
   };
 
@@ -94,6 +135,41 @@ protected:
     private:
       MotrStore *store;
       RGWAccessControlPolicy acls;
+
+    // RGWBucketInfo and other information that are shown when listing a bucket is
+    // represented in struct MotrBucketInfo. The structure is encoded and stored
+    // as the value of the global bucket instance index.
+    // TODO: compare pros and cons of separating the bucket_attrs (ACLs, tag etc.)
+    // into a different index.
+    struct MotrBucketInfo {
+      RGWBucketInfo info;
+
+      obj_version bucket_version;
+      ceph::real_time mtime;
+
+      rgw::sal::Attrs bucket_attrs;
+
+      void encode(bufferlist& bl)  const
+      {
+        ENCODE_START(4, 4, bl);
+        encode(info, bl);
+        encode(bucket_version, bl);
+        encode(mtime, bl);
+        encode(bucket_attrs, bl); //rgw_cache.h example for a map
+        ENCODE_FINISH(bl);
+      }
+
+      void decode(bufferlist::const_iterator& bl)
+      {
+        DECODE_START(4, bl);
+        decode(info, bl);
+        decode(bucket_version, bl);
+        decode(mtime, bl);
+        decode(bucket_attrs, bl);
+        DECODE_FINISH(bl);
+      }
+    };
+    WRITE_CLASS_ENCODER(MotrBucketInfo);
 
     public:
       MotrBucket(MotrStore *_st)
@@ -154,7 +230,11 @@ protected:
 					DoutPrefixProvider *dpp) override;
       virtual RGWAccessControlPolicy& get_acl(void) override { return acls; }
       virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
+      int put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y);
       virtual int get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y) override;
+      int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
+      int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
+      int create_bucket_index();
       virtual int get_bucket_stats(const DoutPrefixProvider *dpp, int shard_id,
           string *bucket_ver, string *master_ver,
           map<RGWObjCategory, RGWStorageStats>& stats,
@@ -205,7 +285,7 @@ protected:
       MotrStore* store;
       RGWRealm *realm{nullptr};
       RGWZoneGroup *zonegroup{nullptr};
-      RGWZone *zone_public_config{nullptr}; /* external zone params, e.g., entrypoints, log flags, etc. */  
+      RGWZone *zone_public_config{nullptr}; /* external zone params, e.g., entrypoints, log flags, etc. */
       RGWZoneParams *zone_params{nullptr}; /* internal zone params, e.g., rados pools */
       RGWPeriod *current_period{nullptr};
       rgw_zone_id cur_zone_id;
@@ -293,7 +373,7 @@ protected:
           virtual int prepare(optional_yield y, const DoutPrefixProvider* dpp) override;
           virtual int read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp) override;
           virtual int iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y) override;
-          virtual int get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y) override; 
+          virtual int get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y) override;
       };
 
       struct MotrDeleteOp : public DeleteOp {
@@ -493,7 +573,7 @@ protected:
       virtual int cluster_stat(RGWClusterStat& stats) override;
       virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
       virtual std::unique_ptr<Completions> get_completions(void) override;
-      virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, struct req_state* s, 
+      virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, struct req_state* s,
           rgw::notify::EventType event_type, const string* object_name=nullptr) override;
       virtual RGWLC* get_rgwlc(void) override { return NULL; }
       virtual RGWCoroutinesManagerRegistry* get_cr_registry() override { return NULL; }
@@ -580,7 +660,14 @@ protected:
       int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
       void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }
       int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
-		    vector<uint8_t>& key, vector<uint8_t>& val, bool update = false);
+                    vector<uint8_t>& key, vector<uint8_t>& val, bool update = false);
+
+      void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
+      int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
+      int create_motr_idx_by_name(string iname);
+      int do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
+                            string key_str, bufferlist &bl);
+      int check_n_create_global_indices();
   };
 
 } } // namespace rgw::sal

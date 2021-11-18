@@ -19,10 +19,12 @@
 #include <unistd.h>
 #include <sstream>
 
+extern "C" {
 #include "motr/config.h"
 #include "lib/types.h"
 #include "lib/trace.h"   // m0_trace_set_mmapped_buffer
 #include "motr/layout.h" // M0_OBJ_LAYOUT_ID
+}
 
 #include "common/Clock.h"
 #include "common/errno.h"
@@ -105,68 +107,63 @@ namespace rgw::sal {
     return 0;
   }
 
-  // m0_idx must be open already
-  static int get_user(const DoutPrefixProvider *dpp, MotrStore *store,
-                      struct m0_idx *idx, RGWUserInfo& info, RGWObjVersionTracker& objv)
+  static int load_user_from_idx(const DoutPrefixProvider *dpp,
+                                MotrStore *store,
+                                RGWUserInfo& info, map<string, bufferlist> *attrs,
+                                RGWObjVersionTracker *objv_tracker)
   {
-    vector<uint8_t> key, val;
-
-    key.assign(info.user_id.id.begin(), info.user_id.id.end());
-    int rc = store->do_idx_op(idx, M0_IC_GET, key, val);
-    if (rc != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: GET idx op failed: " << rc << dendl;
-      return rc;
-    }
-
     bufferlist bl;
-    bl.append(reinterpret_cast<char*>(val.data()), val.size());
-    auto iter = bl.cbegin();
-    try {
-      decode(info, iter);
-      decode(objv.read_version, iter);
-      decode(attrs, iter);
-    } catch (buffer::error& err) {
-      ldpp_dout(dpp, 0) << "ERROR: failed to decode user info" << dendl;
-      rc = -EIO;
-    }
+    ldpp_dout(dpp, 0) << "info.user_id.id = "  << info.user_id.id << dendl;
+    int rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                      M0_IC_GET, info.user_id.id, bl);
+    ldpp_dout(dpp, 0) << "do_idx_op_by_name() = "  << rc << dendl;
+    if (rc < 0)
+        return rc;
 
-    return rc;
+    struct MotrUserInfo muinfo;
+    bufferlist& blr = bl;
+    auto iter = blr.cbegin();
+    muinfo.decode(iter);
+    info = muinfo.info;
+    if (attrs)
+      *attrs = muinfo.attrs;
+    if (objv_tracker)
+      objv_tracker->read_version = muinfo.user_version;
+
+    return 0;
   }
 
-  int MotrUser::load_user(const DoutPrefixProvider *dpp, optional_yield y)
+  int MotrUser::load_user(const DoutPrefixProvider *dpp,
+                          optional_yield y)
   {
-//    int ret = store->getDB()->get_user(dpp, string("user_id"), "", info, &attrs,
-//        &objv_tracker);
-    int rc = store->open_idx(&idxID, true, &idx);
-    if (rc != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: failed to open index: " << rc << dendl;
-      return rc;
-    }
 
-    rc = get_user(dpp, store, &idx, info, objv_tracker);
-
-    store->close_idx(&idx);
-    return rc;
+    return load_user_from_idx(dpp, store, info, &attrs, &objv_tracker);
   }
 
-  int MotrUser::store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info)
+  int MotrUser::create_user_info_idx()
   {
-    //int ret = store->getDB()->store_user(dpp, info, exclusive, &attrs, &objv_tracker, old_info);
-    vector<uint8_t> key, val;
+    string bucket_index_iname = "motr.rgw.user.info." + info.user_id.id;
+    return store->create_motr_idx_by_name(bucket_index_iname);
+  }
+
+  int MotrUser::store_user(const DoutPrefixProvider* dpp,
+                           optional_yield y, bool exclusive, RGWUserInfo* old_info)
+  {
     bufferlist bl;
+    struct MotrUserInfo muinfo;
     RGWUserInfo orig_info;
-    RGWObjVersionTracker objv = {};
-    obj_version& obj_ver = objv.read_version;
+    RGWObjVersionTracker objv_tracker = {};
+    obj_version& obj_ver = objv_tracker.read_version;
 
-    int rc = store->open_idx(&idxID, true, &idx);
-    if (rc != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: failed to open index: " << rc << dendl;
-      goto out;
-    }
+    ldpp_dout(dpp, 0) << "Store_user(): User = " << info.user_id.id << dendl;
+    orig_info.user_id.id = info.user_id.id;
+    // XXX: we open and close motr idx 2 times in this method:
+    // 1) on load_user_from_idx() here and 2) on do_idx_op_by_name(PUT) below.
+    // Maybe this can be optimised later somewhow.
+    int rc = load_user_from_idx(dpp, store, orig_info, nullptr, &objv_tracker);
+    ldpp_dout(dpp, 0) << "Get user: rc = " << rc << dendl;
 
     // Check if the user already exists
-    orig_info.user_id = info.user_id;
-    rc = get_user(dpp, store, &idx, orig_info, objv);
     if (rc == 0 && obj_ver.ver > 0) {
       if (old_info)
         *old_info = orig_info;
@@ -186,20 +183,26 @@ namespace rgw::sal {
       obj_ver.tag = "UserTAG";
     }
 
-    key.assign(info.user_id.id.begin(), info.user_id.id.end());
-    encode(info, bl);
-    encode(obj_ver, bl);
-    encode(attrs, bl);
-    val.assign(reinterpret_cast<uint8_t*>(bl.c_str()),
-               reinterpret_cast<uint8_t*>(bl.c_str() + bl.length()));
-    rc = store->do_idx_op(&idx, M0_IC_PUT, key, val);
-
+    muinfo.info = info;
+    muinfo.attrs = attrs;
+    muinfo.user_version = obj_ver;
+    muinfo.encode(bl);
+    rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                  M0_IC_PUT, info.user_id.id, bl);
+    ldpp_dout(dpp, 0) << "Store user to motr index: rc = " << rc << dendl;
     if (rc == 0) {
       objv_tracker.read_version = obj_ver;
       objv_tracker.write_version = obj_ver;
     }
+
+    // Create user info index to store all buckets that are belong
+    // to this bucket.
+    rc = create_user_info_idx();
+    if (rc < 0 && rc != -EEXIST) {
+      ldpp_dout(dpp, 0) << "Failed to create user info index: rc = " << rc << dendl;
+    }
+
   out:
-    store->close_idx(&idx);
     return rc;
   }
 
@@ -232,14 +235,68 @@ namespace rgw::sal {
     return 0;
   }
 
+  int MotrBucket::put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
+  {
+    bufferlist bl;
+    struct MotrBucketInfo mbinfo;
+
+    mbinfo.info = info;
+    mbinfo.bucket_attrs = attrs;
+    //mbinfo.mtime = ;
+    mbinfo.bucket_version = bucket_version;
+    mbinfo.encode(bl);
+
+    // Insert bucket instance using bucket's marker (string).
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_PUT, info.bucket.marker, bl);
+    return rc;
+  }
+
   int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
   {
-    int ret = 0;
+    // Get bucket instance using bucket's marker (string). or bucket id?
+    bufferlist bl;
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_GET, info.bucket.marker, bl);
+    if (rc < 0)
+        return rc;
 
-//    ret = store->getDB()->get_bucket_info(dpp, string("name"), "", info, &attrs,
-//        &mtime, &bucket_version);
+    struct MotrBucketInfo mbinfo;
+    bufferlist& blr = bl;
+    auto iter =blr.cbegin();
+    mbinfo.decode(iter); //Decode into MotrBucketInfo.
+    info = mbinfo.info;
+    attrs = mbinfo.bucket_attrs;
+    mtime = mbinfo.mtime;
+    bucket_version = mbinfo.bucket_version;
 
-    return ret;
+    return rc;
+  }
+
+  int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
+  {
+    bufferlist bl;
+    RGWBucketEntryPoint ep;
+    ep.bucket = info.bucket;
+    ep.owner = new_user->get_id();
+    ep.creation_time = get_creation_time();
+    ep.linked = true;
+    ep.encode(bl);
+
+    // Insert the user into the user info index.
+    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_PUT, info.bucket.marker, bl);
+
+  }
+
+  int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
+  {
+    // Remove the user into the user info index.
+    bufferlist bl;
+    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_DEL, info.bucket.marker, bl);
   }
 
   /* stats - Not for first pass */
@@ -249,6 +306,12 @@ namespace rgw::sal {
       std::string *max_marker, bool *syncstopped)
   {
     return 0;
+  }
+
+  int MotrBucket::create_bucket_index()
+  {
+    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.marker;
+    return store->create_motr_idx_by_name(bucket_index_iname);
   }
 
   int MotrBucket::get_bucket_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
@@ -934,7 +997,7 @@ namespace rgw::sal {
 //    parent_op.meta.if_nomatch = if_nomatch;
 //    parent_op.meta.user_data = user_data;
 //    parent_op.meta.zones_trace = zones_trace;
-//    
+//
 //    /* XXX: handle accounted size */
 //    accounted_size = total_data_size;
 //    int ret = parent_op.write_meta(dpp, total_data_size, accounted_size, attrs);
@@ -1118,7 +1181,7 @@ namespace rgw::sal {
   int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
       User* u, const rgw_bucket& b,
       const string& zonegroup_id,
-      rgw_placement_rule& placement_rule,
+      rgw_placement_rule& placement_rule, //not applied to Motr
       string& swift_ver_location,
       const RGWQuotaInfo * pquota_info,
       const RGWAccessControlPolicy& policy,
@@ -1132,87 +1195,60 @@ namespace rgw::sal {
       std::unique_ptr<Bucket>* bucket_out,
       optional_yield y)
   {
-//    int ret;
-//    bufferlist in_data;
-//    RGWBucketInfo master_info;
-//    rgw_bucket *pmaster_bucket = nullptr;
-//    uint32_t *pmaster_num_shards = nullptr;
-//    real_time creation_time;
-//    std::unique_ptr<Bucket> bucket;
-//    obj_version objv, *pobjv = NULL;
-//
-//    /* If it exists, look it up; otherwise create it */
-//    ret = get_bucket(dpp, u, b, &bucket, y);
-//    if (ret < 0 && ret != -ENOENT)
-//      return ret;
-//
-//    if (ret != -ENOENT) {
-//      RGWAccessControlPolicy old_policy(ctx());
-//      *existed = true;
-//      if (swift_ver_location.empty()) {
-//        swift_ver_location = bucket->get_info().swift_ver_location;
-//      }
-//      placement_rule.inherit_from(bucket->get_info().placement_rule);
-//
-//      // don't allow changes to the acl policy
-//      /*    int r = rgw_op_get_bucket_policy_from_attr(dpp, this, u, bucket->get_attrs(),
-//            &old_policy, y);
-//            if (r >= 0 && old_policy != policy) {
-//            bucket_out->swap(bucket);
-//            return -EEXIST;
-//            }*/
-//    } else {
-//      bucket = std::make_unique<MotrBucket>(this, b, u);
-//      *existed = false;
-//      bucket->set_attrs(attrs);
-//      // XXX: For now single default zone and STANDARD storage class
-//      // supported.
-//      placement_rule.name = "default";
-//      placement_rule.storage_class = "STANDARD";
-//    }
-//
-//    /*
-//     * XXX: If not master zone, fwd the request to master zone.
-//     * For now MotrStore has single zone.
-//     */
-//    std::string zid = zonegroup_id;
-//    /* if (zid.empty()) {
-//       zid = svc()->zone->get_zonegroup().get_id();
-//       } */
-//
-//    if (*existed) {
-//      rgw_placement_rule selected_placement_rule;
-//      /* XXX: Handle this when zone is implemented
-//         ret = svc()->zone->select_bucket_placement(u.get_info(),
-//         zid, placement_rule,
-//         &selected_placement_rule, nullptr, y);
-//         if (selected_placement_rule != info.placement_rule) {
-//         ret = -EEXIST;
-//         bucket_out->swap(bucket);
-//         return ret;
-//         } */
-//    } else {
-//
-//      /* XXX: We may not need to send all these params. Cleanup the unused ones */
-//      ret = getDB()->create_bucket(dpp, u->get_info(), bucket->get_key(),
-//          zid, placement_rule, swift_ver_location, pquota_info,
-//          attrs, info, pobjv, &ep_objv, creation_time,
-//          pmaster_bucket, pmaster_num_shards, y, exclusive);
-//      if (ret == -EEXIST) {
-//        *existed = true;
-//        ret = 0;
-//      } else if (ret != 0) {
-//        return ret;
-//      }
-//    }
-//
-//    bucket->set_version(ep_objv);
-//    bucket->get_info() = info;
-//
-//    bucket_out->swap(bucket);
-//
-    //return ret;
-    return 0;
+    int ret;
+    bufferlist in_data;
+    RGWBucketInfo master_info;
+    real_time creation_time;
+    std::unique_ptr<Bucket> bucket;
+
+    // Look up the bucket. Create it if it doesn't exist.
+    ret = get_bucket(dpp, u, b, &bucket, y);
+    if (ret < 0 && ret != -ENOENT)
+      return ret;
+
+    if (ret != -ENOENT) {
+      *existed = true;
+      if (swift_ver_location.empty()) {
+        swift_ver_location = bucket->get_info().swift_ver_location;
+      }
+
+      // TODO: ACL policy
+      // // don't allow changes to the acl policy
+      //RGWAccessControlPolicy old_policy(ctx());
+      //int rc = rgw_op_get_bucket_policy_from_attr(
+      //           dpp, this, u, bucket->get_attrs(), &old_policy, y);
+      //if (rc >= 0 && old_policy != policy) {
+      //    bucket_out->swap(bucket);
+      //    return -EEXIST;
+      //}
+    } else {
+      bucket = std::make_unique<MotrBucket>(this, b, u);
+      *existed = false;
+      bucket->set_attrs(attrs);
+    }
+
+    // TODO: how to handle zone and multi-site.
+
+    if (!*existed) {
+        // Create a new bucket: (1) Add a key/value pair in the
+        // bucket instance index. (2) Create a new bucket index.
+        MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
+        ret = mbucket->put_bucket_info(dpp, y)? :
+              mbucket->create_bucket_index();
+        if (ret < 0)
+          ldout(cctx, 0) << "ERROR: failed to create bucket instance index! " << ret << dendl;
+
+       // Insert the bucket entry into the user info index.
+       ret = mbucket->link_user(dpp, u, y);
+       if (ret < 0)
+          ldout(cctx, 0) << "ERROR: failed to add bucket entry! " << ret << dendl;
+    }
+
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
+    bucket_out->swap(bucket);
+
+    return ret;
   }
 
   bool MotrStore::is_meta_master()
@@ -1283,7 +1319,7 @@ namespace rgw::sal {
 
   void MotrStore::get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota)
   {
-    // XXX: Not handled for the first pass 
+    // XXX: Not handled for the first pass
     return;
   }
 
@@ -1340,7 +1376,7 @@ namespace rgw::sal {
     return 0;
   }
 
-  int MotrStore::read_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, 
+  int MotrStore::read_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool *is_truncated,
       RGWUsageIter& usage_iter,
       map<rgw_user_bucket, rgw_usage_log_entry>& usage)
@@ -1423,7 +1459,7 @@ namespace rgw::sal {
     int rc, rc_i;
     struct m0_bufvec k, v, *vp = &v;
     uint32_t flags = 0;
-    struct m0_op *op;
+    struct m0_op *op = NULL;
 
     if (m0_bufvec_empty_alloc(&k, 1) != 0) {
       ldout(cctx, 0) << "ERROR: failed to allocate key bufvec" << dendl;
@@ -1439,6 +1475,8 @@ namespace rgw::sal {
     }
 
     set_m0bufvec(&k, key);
+    ldout(cctx, 0) << "bv->ov_buf[0] = " << k.ov_buf[0] << dendl;
+    ldout(cctx, 0) << "bv->ov_vec.v_count[0]" << k.ov_buf[0] << dendl;
     if (opcode == M0_IC_PUT)
       set_m0bufvec(&v, val);
 
@@ -1467,6 +1505,7 @@ namespace rgw::sal {
 
     if (rc_i != 0) {
       ldout(cctx, 0) << "ERROR: idx op failed: " << rc_i << dendl;
+      rc = rc_i;
       goto out;
     }
 
@@ -1484,6 +1523,123 @@ namespace rgw::sal {
 
     return rc;
   }
+
+  int MotrStore::open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx)
+  {
+    m0_idx_init(idx, &container.co_realm, id);
+    return 0;
+  }
+
+  // The following marcos are from dix/fid_convert.h which are not exposed.
+  enum {
+        M0_DIX_FID_DEVICE_ID_OFFSET   = 32,
+        M0_DIX_FID_DIX_CONTAINER_MASK = (1ULL << M0_DIX_FID_DEVICE_ID_OFFSET)
+                                        - 1,
+  };
+
+  // md5 is used here, a more robust way to convert index name to fid is
+  // needed to avoid collision.
+  void MotrStore::index_name_to_motr_fid(string iname, struct m0_uint128 *id)
+  {
+    unsigned char md5[16];  // 128/8 = 16
+    MD5 hash;
+
+    // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+    hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+    hash.Update((const unsigned char *)iname.c_str(), iname.length());
+    hash.Final(md5);
+
+    memcpy(&id->u_hi, md5, 8);
+    memcpy(&id->u_lo, md5 + 8, 8);
+    ldout(cctx, 0) << "id = 0x " << std::hex << id->u_hi << ":0x" << std::hex << id->u_lo  << dendl;
+
+    struct m0_fid *fid = (struct m0_fid*)id;
+    m0_fid_tset(fid, m0_dix_fid_type.ft_id,
+                fid->f_container & M0_DIX_FID_DIX_CONTAINER_MASK,
+		fid->f_key);
+    ldout(cctx, 0) << "converted id = 0x " << std::hex << id->u_hi << ":0x" << std::hex << id->u_lo  << dendl;
+  }
+
+  int MotrStore::do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
+                                   string key_str, bufferlist &bl)
+  {
+    struct m0_idx idx;
+    vector<uint8_t> key(key_str.begin(), key_str.end());
+    vector<uint8_t> val;
+    struct m0_uint128 idx_id;
+
+    index_name_to_motr_fid(idx_name, &idx_id);
+    int rc = open_motr_idx(&idx_id, &idx);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+      goto out;
+    }
+
+    if (opcode == M0_IC_PUT)
+      val.assign(bl.c_str(), bl.c_str() + bl.length());
+
+    ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key.data()) << dendl;
+    rc = do_idx_op(&idx, opcode, key, val);
+    ldout(cctx, 0) << "do_idx_op() = " << rc << dendl;
+    if (rc == 0 && opcode == M0_IC_GET)
+      // Append the returned value (blob) to the bufferlist.
+      bl.append(reinterpret_cast<char*>(val.data()), val.size());
+
+  out:
+    m0_idx_fini(&idx);
+    return rc;
+  }
+
+  int MotrStore::create_motr_idx_by_name(string iname)
+  {
+    struct m0_idx idx;
+    struct m0_uint128 id;
+
+    index_name_to_motr_fid(iname, &id);
+    m0_idx_init(&idx, &container.co_realm, &id);
+
+    // create index or make sure it's created
+    struct m0_op *op = NULL;
+    int rc = m0_entity_create(NULL, &idx.in_entity, &op);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
+      goto out;
+    }
+
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    if (rc != 0 && rc != -EEXIST)
+      ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
+  out:
+    m0_idx_fini(&idx);
+    return rc;
+  }
+
+  // If a global index is checked (if it has been create) every time
+  // before they're queried (put/get), which takes 2 Motr operations to
+  // complete the query. As the global indices' name and FID are known
+  // already when MotrStore is created, we move the check and creation
+  // in newMotrStore().
+  // Similar method is used for per bucket/user index. For example,
+  // bucket instance index is created when creating the bucket.
+  int MotrStore::check_n_create_global_indices()
+  {
+    int rc = 0;
+
+    for (const auto& iname : motr_global_indices) {
+        rc = create_motr_idx_by_name(iname);
+	if (rc < 0 && rc != -EEXIST)
+          break;
+        rc = 0;
+    }
+
+    return rc;
+  }
+
 } // namespace rgw::sal
 
 extern "C" {
@@ -1497,10 +1653,11 @@ extern "C" {
       store->conf.mc_is_oostore     = true;
       // XXX: these params should be taken from config settings and
       // cct somehow?
-      store->conf.mc_local_addr     = "192.168.180.182@tcp:12345:4:1";
-      store->conf.mc_ha_addr        = "192.168.180.182@tcp:12345:1:1";
-      store->conf.mc_profile        = "0x7000000000000001:0x4f";
-      store->conf.mc_process_fid    = "0x7200000000000001:0x29";
+      store->instance = NULL;
+      store->conf.mc_local_addr     = "172.16.179.134@tcp:12345:34:101";
+      store->conf.mc_ha_addr        = "172.16.179.134@tcp:12345:34:1";
+      store->conf.mc_profile        = "0x7000000000000001:0x0";
+      store->conf.mc_process_fid    = "0x7200000000000001:0x0";
       store->conf.mc_tm_recv_queue_min_len =    64;
       store->conf.mc_max_rpc_msg_size      = 65536;
       store->conf.mc_idx_service_id  = M0_IDX_DIX;
@@ -1520,6 +1677,14 @@ extern "C" {
 	ldout(cct, 0) << "ERROR: m0_container_init() failed: " << rc << dendl;
 	goto out;
       }
+
+      // Create global indices if not yet.
+      rc = store->check_n_create_global_indices();
+      if (rc != 0) {
+	ldout(cct, 0) << "ERROR: check_n_create_global_indices() failed: " << rc << dendl;
+	goto out;
+      }
+
     }
 
 out:
