@@ -86,7 +86,9 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
     return store;
   }
 
-  if (svc.compare("dbstore") == 0) {
+  ldpp_dout(dpp, 0) << "Store = " + svc << dendl;
+
+    if (svc.compare("dbstore") == 0) {
 #ifdef WITH_RADOSGW_DBSTORE
     rgw::sal::Store* store = newDBStore(cct);
 
@@ -111,26 +113,50 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
 #endif
   }
 
-  if (svc.compare("m0store") == 0) {
+  if (svc.compare("motr") == 0) {
 #ifdef WITH_RADOSGW_MOTR
+    ldpp_dout(dpp, 0) << "newMotrStore()" << dendl;
     rgw::sal::Store* store = newMotrStore(cct);
+    if (store == nullptr) {
+      ldpp_dout(dpp, 0) << "newMotrStore() failed!" << dendl;
+      return store;
+    }
 
     /* Initialize the dbstore with cct & dpp */
-    DB *db = static_cast<rgw::sal::DBStore *>(store)->getDB();
-    db->set_context(cct);
+    //DB *db = static_cast<rgw::sal::DBStore *>(store)->getDB();
+    //db->set_context(cct);
 
     /* XXX: temporary - create testid user */
-    rgw_user testid_user("", "testid", "");
+    ldpp_dout(dpp, 0) << "Create testid and user for Motr" << dendl;
+    rgw_user testid_user("tenant", "tester", "ns");
     std::unique_ptr<rgw::sal::User> user = store->get_user(testid_user);
-    user->get_info().display_name = "M. Tester";
-    user->get_info().user_email = "tester@ceph.com";
+    user->get_info().user_id = testid_user;
+    user->get_info().display_name = "Motr Explorer";
+    user->get_info().user_email = "tester@seagate.com";
     RGWAccessKey k1("0555b35654ad1656d804", "h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==");
     user->get_info().access_keys["0555b35654ad1656d804"] = k1;
 
+    ldpp_dout(dpp, 0) << "Store testid and user for Motr. User = " << user->get_info().user_id.id << dendl;
     int r = user->store_user(dpp, null_yield, true);
     if (r < 0) {
       ldpp_dout(dpp, 0) << "ERROR: failed inserting testid user in dbstore error r=" << r << dendl;
     }
+
+    // Read user info and compare.
+    rgw_user ruser("", "tester", "");
+    std::unique_ptr<rgw::sal::User> suser = store->get_user(ruser);
+    suser->get_info().user_id = ruser;
+    r = suser->load_user(dpp, null_yield);
+    if (r == 0) {
+      ldpp_dout(dpp, 0) << "Read and compare user info: " << dendl;
+      ldpp_dout(dpp, 0) << "User id = " << suser->get_info().user_id.id << dendl;
+      ldpp_dout(dpp, 0) << "User display name = " << suser->get_info().display_name << dendl;
+      ldpp_dout(dpp, 0) << "User email = " << suser->get_info().user_email << dendl;
+      //ldpp_dout(dpp, 0) << "User access_keys = " << suser->get_info().access_keys << dendl;
+
+    } else
+      ldpp_dout(dpp, 0) << "ERROR: failed to load testid user in dbstore error r=" << r << dendl;
+
     return store;
 #endif
   }
@@ -167,7 +193,7 @@ rgw::sal::Store* StoreManager::init_raw_storage_provider(const DoutPrefixProvide
 #endif
   }
 
-  if (svc.compare("m0store") == 0) {
+  if (svc.compare("motr") == 0) {
 #ifdef WITH_RADOSGW_MOTR
     store = newMotrStore(cct);
 #else
