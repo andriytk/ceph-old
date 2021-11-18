@@ -107,15 +107,16 @@ namespace rgw::sal {
     return 0;
   }
 
-  int MotrUser::load_user_from_motr_idx(const DoutPrefixProvider *dpp,
-		                        RGWUserInfo& info, map<string, bufferlist> *attrs,
-                                        RGWObjVersionTracker *objv_tracker)
+  static int load_user_from_idx(const DoutPrefixProvider *dpp,
+                                MotrStore *store,
+                                RGWUserInfo& info, map<string, bufferlist> *attrs,
+                                RGWObjVersionTracker *objv_tracker)
   {
     bufferlist bl;
     ldpp_dout(dpp, 0) << "info.user_id.id = "  << info.user_id.id << dendl;
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_USERS_IDX_NAME,
-                                           M0_IC_GET, info.user_id.id, bl);
-    ldpp_dout(dpp, 0) << "query_motr_idx_by_name() = "  << rc << dendl;
+    int rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                      M0_IC_GET, info.user_id.id, bl);
+    ldpp_dout(dpp, 0) << "do_idx_op_by_name() = "  << rc << dendl;
     if (rc < 0)
         return rc;
 
@@ -136,7 +137,7 @@ namespace rgw::sal {
                           optional_yield y)
   {
 
-    return load_user_from_motr_idx(dpp, info, &attrs, &objv_tracker);
+    return load_user_from_idx(dpp, store, info, &attrs, &objv_tracker);
   }
 
   int MotrUser::create_user_info_idx()
@@ -156,7 +157,10 @@ namespace rgw::sal {
 
     ldpp_dout(dpp, 0) << "Store_user(): User = " << info.user_id.id << dendl;
     orig_info.user_id.id = info.user_id.id;
-    int rc = load_user_from_motr_idx(dpp, orig_info, nullptr, &objv_tracker);
+    // XXX: we open and close motr idx 2 times in this method:
+    // 1) on load_user_from_idx() here and 2) on do_idx_op_by_name(PUT) below.
+    // Maybe this can be optimised later somewhow.
+    int rc = load_user_from_idx(dpp, store, orig_info, nullptr, &objv_tracker);
     ldpp_dout(dpp, 0) << "Get user: rc = " << rc << dendl;
 
     // Check if the user already exists
@@ -183,8 +187,8 @@ namespace rgw::sal {
     muinfo.attrs = attrs;
     muinfo.user_version = obj_ver;
     muinfo.encode(bl);
-    rc = store->query_motr_idx_by_name(RGW_MOTR_USERS_IDX_NAME,
-                                       M0_IC_PUT, info.user_id.id, bl);
+    rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                  M0_IC_PUT, info.user_id.id, bl);
     ldpp_dout(dpp, 0) << "Store user to motr index: rc = " << rc << dendl;
     if (rc == 0) {
       objv_tracker.read_version = obj_ver;
@@ -243,8 +247,8 @@ namespace rgw::sal {
     mbinfo.encode(bl);
 
     // Insert bucket instance using bucket's marker (string).
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_PUT, info.bucket.marker, bl);
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_PUT, info.bucket.marker, bl);
     return rc;
   }
 
@@ -252,8 +256,8 @@ namespace rgw::sal {
   {
     // Get bucket instance using bucket's marker (string). or bucket id?
     bufferlist bl;
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_GET, info.bucket.marker, bl);
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_GET, info.bucket.marker, bl);
     if (rc < 0)
         return rc;
 
@@ -281,8 +285,8 @@ namespace rgw::sal {
 
     // Insert the user into the user info index.
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
-    return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_PUT, info.bucket.marker, bl);
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_PUT, info.bucket.marker, bl);
 
   }
 
@@ -291,8 +295,8 @@ namespace rgw::sal {
     // Remove the user into the user info index.
     bufferlist bl;
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
-    return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_DEL, info.bucket.marker, bl);
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_DEL, info.bucket.marker, bl);
   }
 
   /* stats - Not for first pass */
@@ -1556,8 +1560,8 @@ namespace rgw::sal {
     ldout(cctx, 0) << "converted id = 0x " << std::hex << id->u_hi << ":0x" << std::hex << id->u_lo  << dendl;
   }
 
-  int MotrStore::query_motr_idx_by_name(string idx_name, enum m0_idx_opcode opcode,
-                                        string key_str, bufferlist &bl)
+  int MotrStore::do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
+                                   string key_str, bufferlist &bl)
   {
     struct m0_idx idx;
     vector<uint8_t> key(key_str.begin(), key_str.end());

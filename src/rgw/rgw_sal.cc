@@ -122,10 +122,6 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
       return store;
     }
 
-    /* Initialize the dbstore with cct & dpp */
-    //DB *db = static_cast<rgw::sal::DBStore *>(store)->getDB();
-    //db->set_context(cct);
-
     /* XXX: temporary - create testid user */
     ldpp_dout(dpp, 0) << "Create testid and user for Motr" << dendl;
     rgw_user testid_user("tenant", "tester", "ns");
