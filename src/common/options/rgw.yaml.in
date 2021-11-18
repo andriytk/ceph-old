@@ -3252,6 +3252,7 @@ options:
   enum_values:
   - rados
   - dbstore
+  - motr
 - name: rgw_luarocks_location
   type: str
   level: advanced
