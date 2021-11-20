@@ -40,6 +40,8 @@ namespace rgw::sal {
   // TODO: properly handle the number of key/value pairs to get in
   // one query. Now the POC simply tries to retrieve all `max` number of pairs
   // with starting key `marker`.
+  using ::ceph::encode;
+
   int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
       const string& end_marker, uint64_t max, bool need_stats,
       BucketList &buckets, optional_yield y)
@@ -129,15 +131,16 @@ namespace rgw::sal {
     return 0;
   }
 
-  int MotrUser::load_user_from_motr_idx(const DoutPrefixProvider *dpp,
-		                        RGWUserInfo& info, map<string, bufferlist> *attrs,
-                                        RGWObjVersionTracker *objv_tracker)
+  static int load_user_from_idx(const DoutPrefixProvider *dpp,
+                                MotrStore *store,
+                                RGWUserInfo& info, map<string, bufferlist> *attrs,
+                                RGWObjVersionTracker *objv_tracker)
   {
     bufferlist bl;
     ldpp_dout(dpp, 0) << "info.user_id.id = "  << info.user_id.id << dendl;
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_USERS_IDX_NAME,
-                                           M0_IC_GET, info.user_id.id, bl);
-    ldpp_dout(dpp, 0) << "query_motr_idx_by_name()  = "  << rc << dendl;
+    int rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                      M0_IC_GET, info.user_id.id, bl);
+    ldpp_dout(dpp, 0) << "do_idx_op_by_name() = "  << rc << dendl;
     if (rc < 0)
         return rc;
 
@@ -158,7 +161,7 @@ namespace rgw::sal {
                           optional_yield y)
   {
 
-    return load_user_from_motr_idx(dpp, info, &attrs, &objv_tracker);
+    return load_user_from_idx(dpp, store, info, &attrs, &objv_tracker);
   }
 
   int MotrUser::create_user_info_idx()
@@ -178,7 +181,10 @@ namespace rgw::sal {
 
     ldpp_dout(dpp, 0) << "Store_user(): User = " << info.user_id.id << dendl;
     orig_info.user_id.id = info.user_id.id;
-    int rc = load_user_from_motr_idx(dpp, orig_info, nullptr, &objv_tracker);
+    // XXX: we open and close motr idx 2 times in this method:
+    // 1) on load_user_from_idx() here and 2) on do_idx_op_by_name(PUT) below.
+    // Maybe this can be optimised later somewhow.
+    int rc = load_user_from_idx(dpp, store, orig_info, nullptr, &objv_tracker);
     ldpp_dout(dpp, 0) << "Get user: rc = " << rc << dendl;
 
     // Check if the user already exists
@@ -206,39 +212,13 @@ namespace rgw::sal {
     muinfo.attrs = attrs;
     muinfo.user_version = obj_ver;
     muinfo.encode(bl);
-    rc = store->query_motr_idx_by_name(RGW_MOTR_USERS_IDX_NAME,
-                                       M0_IC_PUT, info.user_id.id, bl);
+    rc = store->do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                  M0_IC_PUT, info.user_id.id, bl);
     ldpp_dout(dpp, 0) << "Store user to motr index: rc = " << rc << dendl;
     if (rc == 0) {
       objv_tracker.read_version = obj_ver;
       objv_tracker.write_version = obj_ver;
     }
-
-/*
-    // Insert (access_key, user id) into access_key index. Getting the user
-    // info using access key is the first step when processing any s3 operation
-    // (for example bucket creation).
-    //
-    // Motr index only supports querying using key, not value or part of value.
-    // That is why we can't query the user info index using access_key. An auxiliary
-    // index using access_key as the key is created. Querying a user using
-    // access_key is done in 2 steps: (1) get user id (name) by query
-    // access_key index; (2) use the user id to query user info index.
-    // We may need other auxiliary indices.
-    //
-    // This creates a problem for Motr: DTM is needed to make sure the updates
-    // to multiple indices are atomic.
-    bufferlist akbl;
-    akbl.append(info.user_id.id.c_str(), info.user_id.id.length());
-
-    rc = store->query_motr_idx_by_name(RGW_MOTR_USER_ACCESS_KEY_IDX_NAME,
-                                       M0_IC_PUT, info.user_id.id, bl);
-    ldpp_dout(dpp, 0) << "Store user to motr index: rc = " << rc << dendl;
-    if (rc == 0) {
-      objv_tracker.read_version = obj_ver;
-      objv_tracker.write_version = obj_ver;
-    }
-*/
 
     // Create user info index to store all buckets that are belong
     // to this bucket.
@@ -291,9 +271,9 @@ namespace rgw::sal {
     mbinfo.bucket_version = bucket_version;
     mbinfo.encode(bl);
 
-    // Insert bucket instance using bucket's name (string).
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_PUT, info.bucket.name, bl);
+    // Insert bucket instance using bucket's marker (string).
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_PUT, info.bucket.name, bl);
     return rc;
   }
 
@@ -303,8 +283,8 @@ namespace rgw::sal {
     bufferlist bl;
     ldpp_dout(dpp, 0) << "get_bucket_info(): bucket name  = " << info.bucket.name << dendl;
     ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
-    int rc = store->query_motr_idx_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                           M0_IC_GET, info.bucket.name, bl);
+    int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                      M0_IC_GET, info.bucket.name, bl);
     ldpp_dout(dpp, 0) << "get_bucket_info(): rc  = " << rc << dendl;
     if (rc < 0)
         return rc;
@@ -334,22 +314,8 @@ namespace rgw::sal {
 
     // Insert the user into the user info index.
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
-    return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_PUT, info.bucket.name, bl);
-
- /*
-    RGWBucketEntryPoint ep;
-    ep.bucket = info.bucket;
-    ep.owner = new_user->get_id();
-    ep.creation_time = get_creation_time();
-    ep.linked = true;
-    ep.encode(bl);
-
-    // Insert the user into the user info index.
-    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
-    return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_PUT, info.bucket.name, bl);
- */
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_PUT, info.bucket.name, bl);
 
   }
 
@@ -358,8 +324,8 @@ namespace rgw::sal {
     // Remove the user into the user info index.
     bufferlist bl;
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
-    return store->query_motr_idx_by_name(user_info_idx_name,
-                                         M0_IC_DEL, info.bucket.name, bl);
+    return store->do_idx_op_by_name(user_info_idx_name,
+                                    M0_IC_DEL, info.bucket.name, bl);
   }
 
   /* stats - Not for first pass */
@@ -1726,8 +1692,8 @@ namespace rgw::sal {
     ldout(cctx, 0) << "converted id = 0x " << std::hex << id->u_hi << ":0x" << std::hex << id->u_lo  << dendl;
   }
 
-  int MotrStore::query_motr_idx_by_name(string idx_name, enum m0_idx_opcode opcode,
-                                        string key_str, bufferlist &bl)
+  int MotrStore::do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
+                                   string key_str, bufferlist &bl)
   {
     struct m0_idx idx;
     vector<uint8_t> key(key_str.begin(), key_str.end());
@@ -1830,6 +1796,7 @@ extern "C" {
       store->dix_conf.kc_create_meta = false;
       store->conf.mc_idx_service_conf = &store->dix_conf;
 
+      store->instance = NULL;
       rc = m0_client_init(&store->instance, &store->conf, true);
       if (rc != 0) {
 	ldout(cct, 0) << "ERROR: m0_client_init() failed: " << rc << dendl;

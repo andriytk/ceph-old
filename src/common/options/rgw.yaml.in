@@ -3245,7 +3245,7 @@ options:
   type: str
   level: advanced
   desc: experimental Option to set backend store type
-  long_desc: defaults to rados. Other valid values are dbstore(experimental).
+  long_desc: defaults to rados. Other valid values are dbstore and motr(experimental).
   default: rados
   services:
   - rgw

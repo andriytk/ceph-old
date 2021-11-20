@@ -51,6 +51,31 @@ namespace rgw { namespace sal {
     RGW_MOTR_BUCKET_HD_IDX_NAME
   };
 
+  struct MotrUserInfo {
+    RGWUserInfo info;
+    obj_version user_version;
+    rgw::sal::Attrs attrs;
+
+    void encode(bufferlist& bl)  const
+    {
+      ENCODE_START(3, 3, bl);
+      encode(info, bl);
+      encode(user_version, bl);
+      encode(attrs, bl);
+      ENCODE_FINISH(bl);
+    }
+
+    void decode(bufferlist::const_iterator& bl)
+    {
+      DECODE_START(3, bl);
+      decode(info, bl);
+      decode(user_version, bl);
+      decode(attrs, bl);
+      DECODE_FINISH(bl);
+    }
+  };
+  WRITE_CLASS_ENCODER(MotrUserInfo);
+
 class MotrNotification : public Notification {
 protected:
   Object* obj;
@@ -70,31 +95,6 @@ protected:
       MotrStore         *store;
       struct m0_uint128  idxID = {0xe5ecb53640d4ecce, 0x6a156cd5a74aa3b8}; // MD5 of “motr.rgw.users“
       struct m0_idx      idx;
-
-      struct MotrUserInfo {
-        RGWUserInfo info;
-	obj_version user_version;
-        rgw::sal::Attrs attrs;
-
-        void encode(bufferlist& bl)  const
-        {
-          ENCODE_START(3, 3, bl);
-          encode(info, bl);
-          encode(user_version, bl);
-          encode(attrs, bl);
-          ENCODE_FINISH(bl);
-        }
-
-        void decode(bufferlist::const_iterator& bl)
-        {
-          DECODE_START(3, bl);
-          decode(info, bl);
-	  decode(user_version, bl);
-	  decode(attrs, bl);
-          DECODE_FINISH(bl);
-        }
-
-    };
 
     public:
       MotrUser(MotrStore *_st, const rgw_user& _u) : User(_u), store(_st) { }
@@ -171,8 +171,8 @@ protected:
         decode(bucket_attrs, bl);
         DECODE_FINISH(bl);
       }
-
     };
+    WRITE_CLASS_ENCODER(MotrBucketInfo);
 
     public:
       MotrBucket(MotrStore *_st)
@@ -674,8 +674,8 @@ protected:
       void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
       int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
       int create_motr_idx_by_name(string iname);
-      int query_motr_idx_by_name(string idx_name, enum m0_idx_opcode opcode,
-                                 string key_str, bufferlist &bl);
+      int do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
+                            string key_str, bufferlist &bl);
       int check_n_create_global_indices();
   };
 
