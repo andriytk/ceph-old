@@ -37,24 +37,48 @@ extern "C" {
 
 namespace rgw::sal {
 
+  // TODO: properly handle the number of key/value pairs to get in
+  // one query. Now the POC simply tries to retrieve all `max` number of pairs
+  // with starting key `marker`.
   int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
       const string& end_marker, uint64_t max, bool need_stats,
       BucketList &buckets, optional_yield y)
   {
-//    RGWUserBuckets ulist;
-//    bool is_truncated = false;
-//    int ret;
-//
-//    buckets.clear();
-//    ret = store->getDB()->list_buckets(dpp, info.user_id, marker, end_marker, max,
-//        need_stats, &ulist, &is_truncated);
-//    if (ret < 0)
-//      return ret;
-//
-//    buckets.set_truncated(is_truncated);
-//    for (const auto& ent : ulist.get_buckets()) {
-//      buckets.add(std::make_unique<MotrBucket>(this->store, ent.second, this));
-//    }
+    int rc;
+    vector<string> key_vec(max);
+    vector<bufferlist> val_vec(max);
+    bool is_truncated = false;
+
+    // Retrieve all `max` number of pairs. 
+    buckets.clear();
+    string user_info_iname = "motr.rgw.user.info." + info.user_id.id;
+    key_vec[0] = marker;
+    rc = store->next_query_by_name(user_info_iname, key_vec, val_vec);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      return rc;
+    }
+
+    // Process the returned pairs to add into BucketList.
+    uint64_t bcount = 0;
+    for (const auto& bl: val_vec) {
+      if (bl.length() == 0)
+        break;
+
+      RGWBucketEnt ent;
+      auto iter = bl.cbegin();
+      ent.decode(iter);
+
+      if (!end_marker.empty() &&
+          end_marker.compare(ent.bucket.marker) <= 0)
+        break;
+
+      buckets.add(std::make_unique<MotrBucket>(this->store, ent, this));
+      bcount++;
+    }
+    if (bcount == max)
+      is_truncated = true;
+    buckets.set_truncated(is_truncated);
 
     return 0;
   }
@@ -139,8 +163,8 @@ namespace rgw::sal {
 
   int MotrUser::create_user_info_idx()
   {
-    string bucket_index_iname = "motr.rgw.user.info." + info.user_id.id;
-    return store->create_motr_idx_by_name(bucket_index_iname);
+    string user_info_iname = "motr.rgw.user.info." + info.user_id.id;
+    return store->create_motr_idx_by_name(user_info_iname);
   }
 
   int MotrUser::store_user(const DoutPrefixProvider* dpp,
@@ -300,6 +324,20 @@ namespace rgw::sal {
   int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
   {
     bufferlist bl;
+    RGWBucketEnt new_bucket;
+  
+    // RGWBucketEnt or cls_user_bucket_entry is the structure that is stored.
+    new_bucket.bucket = info.bucket;
+    new_bucket.size = 0;
+    new_bucket.creation_time = get_creation_time();
+    new_bucket.encode(bl);
+
+    // Insert the user into the user info index.
+    string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
+    return store->query_motr_idx_by_name(user_info_idx_name,
+                                         M0_IC_PUT, info.bucket.name, bl);
+
+ /*
     RGWBucketEntryPoint ep;
     ep.bucket = info.bucket;
     ep.owner = new_user->get_id();
@@ -311,6 +349,7 @@ namespace rgw::sal {
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
     return store->query_motr_idx_by_name(user_info_idx_name,
                                          M0_IC_PUT, info.bucket.name, bl);
+ */
 
   }
 
@@ -1545,6 +1584,109 @@ namespace rgw::sal {
     else if (opcode == M0_IC_PUT)
       m0_bufvec_free2(&v);
 
+    return rc;
+  }
+
+  // A quick impl of retrieving a range of key/value pairs.
+  // TODO: it could be merged into do_idx_op().
+  int MotrStore::do_idx_next_op(struct m0_idx *idx,
+                                vector<vector<uint8_t>>& key_vec,
+                                vector<vector<uint8_t>>& val_vec)
+  {
+    int rc;
+    int nr_kvp = val_vec.size();
+    int *rcs = new int[nr_kvp];
+    struct m0_bufvec k, v;
+    struct m0_op *op = NULL;
+
+    if (m0_bufvec_empty_alloc(&k, nr_kvp) != 0) {
+      ldout(cctx, 0) << "ERROR: failed to allocate key bufvec" << dendl;
+      return -ENOMEM;
+    }
+
+    rc = -ENOMEM;
+    if (m0_bufvec_empty_alloc(&v, nr_kvp) != 0) {
+      ldout(cctx, 0) << "ERROR: failed to allocate value bufvec" << dendl;
+      goto out;
+    }
+
+    set_m0bufvec(&k, key_vec[0]);
+    ldout(cctx, 0) << "bv->ov_buf[0] = " << k.ov_buf[0] << dendl;
+    ldout(cctx, 0) << "bv->ov_vec.v_count[0]" << k.ov_buf[0] << dendl;
+
+    rc = m0_idx_op(idx, M0_IC_NEXT, &k, &v, rcs, 0, &op);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: failed to init index op: " << rc << dendl;
+      goto out;
+    }
+
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: op failed: " << rc << dendl;
+      goto out;
+    }
+
+    for (uint32_t i = 0; i < v.ov_vec.v_nr; ++i) {
+      if (rcs[i] < 0)
+	      break;
+
+      vector<uint8_t>& val = val_vec[i];
+      val.resize(v.ov_vec.v_count[i]);
+      memcpy(reinterpret_cast<char*>(val.data()), v.ov_buf[i], v.ov_vec.v_count[0]);
+    }
+
+  out:
+    m0_bufvec_free2(&k);
+    m0_bufvec_free(&v); // cleanup buffer after GET
+
+    delete []rcs;
+    return rc;
+  }
+
+  // Retrieve a number of key/value pairs starting with `key`.
+  // if `key` is empty, then return the key/value pairs starting with
+  // the first one of the index in question.
+  int MotrStore::next_query_by_name(string idx_name,
+                                    vector<string>& key_str_vec,
+				    vector<bufferlist>& val_bl_vec)
+  {
+    int nr_kvp = val_bl_vec.size();
+    struct m0_idx idx;
+    vector<vector<uint8_t>> key_vec(nr_kvp); 
+    vector<vector<uint8_t>> val_vec(nr_kvp);
+    struct m0_uint128 idx_id;
+
+    index_name_to_motr_fid(idx_name, &idx_id);
+    int rc = open_motr_idx(&idx_id, &idx);
+    if (rc != 0) {
+      ldout(cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+      goto out;
+    }
+
+    // Only the first element for key_vec needs to be set for NEXT query.
+    // The key_vec will be set will the returned keys from motr index.
+    key_vec[0].assign(key_str_vec[0].begin(), key_str_vec[0].end());
+    ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key_vec[0].data()) << dendl;
+    rc = do_idx_next_op(&idx, key_vec, val_vec);
+    ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
+    if (rc < 0) {
+      ldout(cctx, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      goto out;
+    }
+
+    for (int i = 0; i < nr_kvp; ++i) {
+      key_str_vec[i].assign(key_vec[i].begin(), key_vec[i].end());
+      bufferlist& vbl = val_bl_vec[i];
+      vbl.append(reinterpret_cast<char*>(val_vec[i].data()), val_vec[i].size());
+    }
+
+  out:
+    m0_idx_fini(&idx);
     return rc;
   }
 
