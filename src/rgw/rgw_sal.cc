@@ -148,7 +148,6 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
       ldpp_dout(dpp, 0) << "User id = " << suser->get_info().user_id.id << dendl;
       ldpp_dout(dpp, 0) << "User display name = " << suser->get_info().display_name << dendl;
       ldpp_dout(dpp, 0) << "User email = " << suser->get_info().user_email << dendl;
-      //ldpp_dout(dpp, 0) << "User access_keys = " << suser->get_info().access_keys << dendl;
 
     } else
       ldpp_dout(dpp, 0) << "ERROR: failed to load testid user in dbstore error r=" << r << dendl;
