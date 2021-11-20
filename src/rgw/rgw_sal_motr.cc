@@ -51,7 +51,7 @@ namespace rgw::sal {
     vector<bufferlist> val_vec(max);
     bool is_truncated = false;
 
-    // Retrieve all `max` number of pairs. 
+    // Retrieve all `max` number of pairs.
     buckets.clear();
     string user_info_iname = "motr.rgw.user.info." + info.user_id.id;
     key_vec[0] = marker;
@@ -70,6 +70,9 @@ namespace rgw::sal {
       RGWBucketEnt ent;
       auto iter = bl.cbegin();
       ent.decode(iter);
+
+      std::time_t ctime = ceph::real_clock::to_time_t(ent.creation_time);
+      ldpp_dout(dpp, 20) << "got creation time: << " << std::put_time(std::localtime(&ctime), "%F %T") << dendl;
 
       if (!end_marker.empty() &&
           end_marker.compare(ent.bucket.marker) <= 0)
@@ -305,12 +308,17 @@ namespace rgw::sal {
   {
     bufferlist bl;
     RGWBucketEnt new_bucket;
-  
+    ceph::real_time creation_time = get_creation_time();
+
     // RGWBucketEnt or cls_user_bucket_entry is the structure that is stored.
     new_bucket.bucket = info.bucket;
     new_bucket.size = 0;
-    new_bucket.creation_time = get_creation_time();
+    if (real_clock::is_zero(creation_time))
+      creation_time = ceph::real_clock::now();
+    new_bucket.creation_time = creation_time;
     new_bucket.encode(bl);
+    std::time_t ctime = ceph::real_clock::to_time_t(new_bucket.creation_time);
+    ldpp_dout(dpp, 20) << "got creation time: << " << std::put_time(std::localtime(&ctime), "%F %T") << dendl;
 
     // Insert the user into the user info index.
     string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.id;
@@ -1623,7 +1631,7 @@ namespace rgw::sal {
   {
     int nr_kvp = val_bl_vec.size();
     struct m0_idx idx;
-    vector<vector<uint8_t>> key_vec(nr_kvp); 
+    vector<vector<uint8_t>> key_vec(nr_kvp);
     vector<vector<uint8_t>> val_vec(nr_kvp);
     struct m0_uint128 idx_id;
 
