@@ -1037,6 +1037,7 @@ namespace rgw::sal {
     int rc;
     unsigned bs, left;
     struct m0_op *op;
+    char *p;
 
     left = data.length();
 
@@ -1061,10 +1062,10 @@ namespace rgw::sal {
     total_data_size += left;
 
     bs = obj.get_optimal_bs(left);
-    for (; left > 0; left -= bs) {
+    for (p = data.c_str(); left > 0; left -= bs, p += bs, offset += bs) {
       if (left < bs)
         bs = left;
-      buf.ov_buf[0] = data.c_str();
+      buf.ov_buf[0] = p;
       buf.ov_vec.v_count[0] = bs;
       ext.iv_index[0] = offset;
       ext.iv_vec.v_count[0] = bs;
