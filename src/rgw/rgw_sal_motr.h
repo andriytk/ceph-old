@@ -365,6 +365,7 @@ protected:
       RGWObjState* state;
 
       struct m0_obj *mobj;
+      uint64_t       layout_id;
 
     public:
 
@@ -488,6 +489,7 @@ protected:
       bool is_opened() { return mobj != NULL; }
       int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
       void close_mobj();
+      unsigned get_optimal_bs(unsigned len);
   };
 
   class MotrAtomicWriter : public Writer {
