@@ -963,6 +963,13 @@ namespace rgw::sal {
     m0_op_fini(op);
     m0_op_free(op);
 
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to create motr object: " << rc << dendl;
+      return rc;
+    }
+
+    layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+
     return rc;
   }
 
@@ -973,6 +980,47 @@ namespace rgw::sal {
     m0_obj_fini(mobj);
     delete mobj;
     mobj = NULL;
+  }
+
+  static unsigned roundup_pow2(unsigned x)
+  {
+    unsigned n;
+    for (n = 1; n < x; n *= 2) {}
+    return n;
+  }
+
+  unsigned MotrObject::get_optimal_bs(unsigned len)
+  {
+    struct m0_pool_version *pver;
+
+    pver = m0_pool_version_find(&store->instance->m0c_pools_common,
+                                &mobj->ob_attr.oa_pver);
+    M0_ASSERT(pver != NULL);
+    struct m0_pdclust_attr *pa = &pver->pv_attr;
+    unsigned unit_sz = m0_obj_layout_id_to_unit_size(layout_id);
+    unsigned grp_sz  = unit_sz * pa->pa_N;
+
+    // bs should be max 4-times pool-width deep counting by 1MB units, or
+    // 8-times deep counting by 512K units, 16-times deep by 256K units,
+    // and so on. Several units to one target will be aggregated to make
+    // fewer network RPCs, disk i/o operations and BE transactions.
+    // For unit sizes of 32K or less, the depth is 128, which
+    // makes it 32K * 128 == 4MB - the maximum amount per target when
+    // the performance is still good on LNet (which has max 1MB frames).
+    // TODO: it may be different on libfabric, should be re-measured.
+    unsigned depth = 128 / ((unit_sz + 0x7fff) / 0x8000);
+    if (depth == 0)
+      depth = 1;
+    // P * N / (N + K + S) - number of data units to span the pool-width
+    unsigned max_bs = depth * unit_sz * pa->pa_P * pa->pa_N /
+                                       (pa->pa_N + pa->pa_K + pa->pa_S);
+    max_bs = ((max_bs - 1) / grp_sz + 1) * grp_sz; // multiple of group size
+    if (len >= max_bs)
+      return max_bs;
+    else if (len <= grp_sz)
+      return grp_sz;
+    else
+      return roundup_pow2(len);
   }
 
   int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
@@ -1099,6 +1147,8 @@ namespace rgw::sal {
 //    if (canceled) {
 //      *canceled = parent_op.meta.canceled;
 //    }
+
+    obj.close_mobj();
 
     return 0;
 
