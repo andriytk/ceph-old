@@ -364,7 +364,10 @@ protected:
        */
       RGWObjState* state;
 
+      struct m0_obj *mobj;
+
     public:
+
       struct MotrReadOp : public ReadOp {
         private:
           MotrObject* source;
@@ -395,12 +398,14 @@ protected:
       MotrObject(MotrStore *_st, const rgw_obj_key& _k)
         : Object(_k),
         store(_st),
-        acls() {
+        acls(),
+        mobj(NULL) {
         }
       MotrObject(MotrStore *_st, const rgw_obj_key& _k, Bucket* _b)
         : Object(_k, _b),
         store(_st),
-        acls() {
+        acls(),
+        mobj(NULL) {
         }
       MotrObject(MotrObject& _o) = default;
 
@@ -478,6 +483,11 @@ protected:
           bool must_exist, optional_yield y) override;
     private:
       //int read_attrs(const DoutPrefixProvider* dpp, Motr::Object::Read &read_op, optional_yield y, rgw_obj* target_obj = nullptr);
+
+    public:
+      bool is_opened() { return mobj != NULL; }
+      int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
+      void close_mobj();
   };
 
   class MotrAtomicWriter : public Writer {
