@@ -926,9 +926,67 @@ namespace rgw::sal {
     return 0;
   }
 
+  int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+  {
+    if (mobj != NULL) {
+      ldpp_dout(dpp, 0) << "ERROR: object is already opened" << dendl;
+      return -EINVAL;
+    }
+    // calculate FID from the object name (key) and its bucket marker
+    MD5 hash;
+    // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+    hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+    hash.Update((const unsigned char *)this->get_key().to_str().c_str(),
+		this->get_key().to_str().length());
+    hash.Update((const unsigned char *)this->get_bucket()->get_marker().c_str(),
+		this->get_bucket()->get_marker().length());
+    unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
+    hash.Final(md5);
+    struct m0_uint128 obj_fid;
+    memcpy(&obj_fid, md5, sizeof obj_fid);
+
+    int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
+    M0_ASSERT(lid > 0);
+
+    mobj = new (struct m0_obj);
+    m0_obj_init(mobj, &store->container.co_realm, &obj_fid, lid);
+
+    struct m0_op *op;
+    int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
+      return rc;
+    }
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+
+    return rc;
+  }
+
+  void MotrObject::close_mobj()
+  {
+    if (mobj == NULL)
+      return;
+    m0_obj_fini(mobj);
+    delete mobj;
+    mobj = NULL;
+  }
+
   int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
   {
-//    total_data_size += data.length();
+    if (total_data_size == 0 && data.length() > 0 && !obj.is_opened()) {
+      int rc = obj.create_mobj(dpp, data.length());
+      if (rc != 0) {
+	ldpp_dout(dpp, 0) << "ERROR: failed to create motr object" << dendl;
+	return rc;
+      }
+    }
+
+    total_data_size += data.length();
+
 //
 //    /* XXX: Optimize all bufferlist copies in this function */
 //
