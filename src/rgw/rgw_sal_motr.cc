@@ -936,10 +936,12 @@ namespace rgw::sal {
     MD5 hash;
     // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
     hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+    ldpp_dout(dpp, 0) << "DEBUG: key=" << this->get_key().to_str() <<
+                      " bucket=" << this->get_bucket()->get_name() << dendl;
     hash.Update((const unsigned char *)this->get_key().to_str().c_str(),
 		this->get_key().to_str().length());
-    hash.Update((const unsigned char *)this->get_bucket()->get_marker().c_str(),
-		this->get_bucket()->get_marker().length());
+    hash.Update((const unsigned char *)this->get_bucket()->get_name().c_str(),
+		this->get_bucket()->get_name().length());
     unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
     hash.Final(md5);
     struct m0_uint128 obj_fid;
@@ -1073,6 +1075,8 @@ namespace rgw::sal {
     start = cdata.c_str();
 
     for (p = start; left > 0; left -= bs, p += bs, offset += bs) {
+      if (left < bs)
+        bs = obj.get_optimal_bs(left);
       if (left < bs) {
         cdata.append_zero(bs - left);
         left = bs;
