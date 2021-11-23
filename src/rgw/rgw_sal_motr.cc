@@ -1296,7 +1296,7 @@ namespace rgw::sal {
   int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
       User* u, const rgw_bucket& b,
       const string& zonegroup_id,
-      rgw_placement_rule& placement_rule, //not applied to Motr
+      rgw_placement_rule& placement_rule,
       string& swift_ver_location,
       const RGWQuotaInfo * pquota_info,
       const RGWAccessControlPolicy& policy,
@@ -1311,9 +1311,6 @@ namespace rgw::sal {
       optional_yield y)
   {
     int ret;
-    bufferlist in_data;
-    RGWBucketInfo master_info;
-    real_time creation_time;
     std::unique_ptr<Bucket> bucket;
 
     // Look up the bucket. Create it if it doesn't exist.
@@ -1326,6 +1323,7 @@ namespace rgw::sal {
       if (swift_ver_location.empty()) {
         swift_ver_location = bucket->get_info().swift_ver_location;
       }
+      placement_rule.inherit_from(bucket->get_info().placement_rule);
 
       // TODO: ACL policy
       // // don't allow changes to the acl policy
@@ -1337,7 +1335,11 @@ namespace rgw::sal {
       //    return -EEXIST;
       //}
     } else {
-      bucket = std::make_unique<MotrBucket>(this, b, u);
+      placement_rule.name = "default";
+      placement_rule.storage_class = "STANDARD";
+      info.placement_rule = placement_rule;
+      info.bucket = b;
+      bucket = std::make_unique<MotrBucket>(this, info, u);
       *existed = false;
       bucket->set_attrs(attrs);
     }
@@ -1361,6 +1363,7 @@ namespace rgw::sal {
 
     bucket->set_version(ep_objv);
     bucket->get_info() = info;
+
     bucket_out->swap(bucket);
 
     return ret;
