@@ -364,9 +364,11 @@ protected:
        */
       RGWObjState* state;
 
-      struct m0_obj *mobj;
+      uint64_t       layout_id;
 
     public:
+
+      struct m0_obj *mobj = NULL;
 
       struct MotrReadOp : public ReadOp {
         private:
@@ -398,14 +400,12 @@ protected:
       MotrObject(MotrStore *_st, const rgw_obj_key& _k)
         : Object(_k),
         store(_st),
-        acls(),
-        mobj(NULL) {
+        acls() {
         }
       MotrObject(MotrStore *_st, const rgw_obj_key& _k, Bucket* _b)
         : Object(_k, _b),
         store(_st),
-        acls(),
-        mobj(NULL) {
+        acls() {
         }
       MotrObject(MotrObject& _o) = default;
 
@@ -488,6 +488,7 @@ protected:
       bool is_opened() { return mobj != NULL; }
       int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
       void close_mobj();
+      unsigned get_optimal_bs(unsigned len);
   };
 
   class MotrAtomicWriter : public Writer {
@@ -504,6 +505,10 @@ protected:
     uint64_t tail_part_offset;
     uint64_t tail_part_size = 0; /* corresponds to each tail part being
                                   written to dbstore */
+
+    struct m0_bufvec buf;
+    struct m0_bufvec attr;
+    struct m0_indexvec ext;
 
     public:
     MotrAtomicWriter(const DoutPrefixProvider *dpp,
@@ -531,6 +536,7 @@ protected:
                          const string *user_data,
                          rgw_zone_set *zones_trace, bool *canceled,
                          optional_yield y) override;
+    void cleanup();
   };
 
   class MotrStore : public Store {

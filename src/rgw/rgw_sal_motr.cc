@@ -963,6 +963,13 @@ namespace rgw::sal {
     m0_op_fini(op);
     m0_op_free(op);
 
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to create motr object: " << rc << dendl;
+      return rc;
+    }
+
+    layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+
     return rc;
   }
 
@@ -975,106 +982,112 @@ namespace rgw::sal {
     mobj = NULL;
   }
 
+  static unsigned roundup_pow2(unsigned x)
+  {
+    unsigned n;
+    for (n = 1; n < x; n *= 2) {}
+    return n;
+  }
+
+  unsigned MotrObject::get_optimal_bs(unsigned len)
+  {
+    struct m0_pool_version *pver;
+
+    pver = m0_pool_version_find(&store->instance->m0c_pools_common,
+                                &mobj->ob_attr.oa_pver);
+    M0_ASSERT(pver != NULL);
+    struct m0_pdclust_attr *pa = &pver->pv_attr;
+    unsigned unit_sz = m0_obj_layout_id_to_unit_size(layout_id);
+    unsigned grp_sz  = unit_sz * pa->pa_N;
+
+    // bs should be max 4-times pool-width deep counting by 1MB units, or
+    // 8-times deep counting by 512K units, 16-times deep by 256K units,
+    // and so on. Several units to one target will be aggregated to make
+    // fewer network RPCs, disk i/o operations and BE transactions.
+    // For unit sizes of 32K or less, the depth is 128, which
+    // makes it 32K * 128 == 4MB - the maximum amount per target when
+    // the performance is still good on LNet (which has max 1MB frames).
+    // TODO: it may be different on libfabric, should be re-measured.
+    unsigned depth = 128 / ((unit_sz + 0x7fff) / 0x8000);
+    if (depth == 0)
+      depth = 1;
+    // P * N / (N + K + S) - number of data units to span the pool-width
+    unsigned max_bs = depth * unit_sz * pa->pa_P * pa->pa_N /
+                                       (pa->pa_N + pa->pa_K + pa->pa_S);
+    max_bs = ((max_bs - 1) / grp_sz + 1) * grp_sz; // multiple of group size
+    if (len >= max_bs)
+      return max_bs;
+    else if (len <= grp_sz)
+      return grp_sz;
+    else
+      return roundup_pow2(len);
+  }
+
+  void MotrAtomicWriter::cleanup()
+  {
+    m0_indexvec_free(&ext);
+    m0_bufvec_free(&attr);
+    m0_bufvec_free2(&buf);
+
+    obj.close_mobj();
+  }
+
   int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
   {
-    if (total_data_size == 0 && data.length() > 0 && !obj.is_opened()) {
-      int rc = obj.create_mobj(dpp, data.length());
+    int rc;
+    unsigned bs, left;
+    struct m0_op *op;
+    char *p;
+
+    left = data.length();
+
+    if (left == 0)
+      return 0;
+
+    if (total_data_size == 0 && left > 0 && !obj.is_opened()) {
+      rc = obj.create_mobj(dpp, data.length());
       if (rc != 0) {
-	ldpp_dout(dpp, 0) << "ERROR: failed to create motr object" << dendl;
-	return rc;
+        ldpp_dout(dpp, 0) << "ERROR: failed to create motr object" << dendl;
+        return rc;
       }
+      rc = -ENOMEM;
+      if (m0_bufvec_empty_alloc(&buf, 1) != 0)
+        goto err;
+      if (m0_bufvec_alloc(&attr, 1, 1) != 0)
+        goto err;
+      if (m0_indexvec_alloc(&ext, 1) != 0)
+        goto err;
     }
 
-    total_data_size += data.length();
+    total_data_size += left;
 
-//
-//    /* XXX: Optimize all bufferlist copies in this function */
-//
-//    /* copy head_data into meta. */
-//    uint64_t head_size = store->getDB()->get_max_head_size();
-//    unsigned head_len = 0;
-//    uint64_t max_chunk_size = store->getDB()->get_max_chunk_size();
-//    int excess_size = 0;
-//
-//    /* Accumulate tail_data till max_chunk_size or flush op */
-//    bufferlist tail_data;
-//
-//    if (data.length() != 0) {
-//      if (offset < head_size) {
-//        /* XXX: handle case (if exists) where offset > 0 & < head_size */
-//        head_len = std::min((uint64_t)data.length(),
-//                                    head_size - offset);
-//        bufferlist tmp;
-//        data.begin(0).copy(head_len, tmp);
-//        head_data.append(tmp);
-//
-//        //parent_op.meta.data = &head_data;
-//        if (head_len == data.length()) {
-//          return 0;
-//        }
-//
-//        /* Move offset by copy_len */
-//        offset = head_len;
-//      }
-//
-//      /* handle tail parts.
-//       * First accumulate and write data into dbstore in its chunk_size
-//       * parts
-//       */
-//      if (!tail_part_size) { /* new tail part */
-//        tail_part_offset = offset;
-//      }
-//      data.begin(head_len).copy(data.length() - head_len, tail_data);
-//      tail_part_size += tail_data.length();
-//      tail_part_data.append(tail_data);
-//
-//      if (tail_part_size < max_chunk_size)  {
-//        return 0;
-//      } else {
-//        int write_ofs = 0;
-//        while (tail_part_size >= max_chunk_size) {
-//          excess_size = tail_part_size - max_chunk_size;
-//          bufferlist tmp;
-//          tail_part_data.begin(write_ofs).copy(max_chunk_size, tmp);
-//          /* write tail objects data */
-////          int ret = parent_op.write_data(dpp, tmp, tail_part_offset);
-////
-////          if (ret < 0) {
-////            return ret;
-////          }
-//
-//          tail_part_size -= max_chunk_size;
-//          write_ofs += max_chunk_size;
-//          tail_part_offset += max_chunk_size;
-//        }
-//        /* reset tail parts or update if excess data */
-//        if (excess_size > 0) { /* wrote max_chunk_size data */
-//          tail_part_size = excess_size;
-//          bufferlist tmp;
-//          tail_part_data.begin(write_ofs).copy(excess_size, tmp);
-//          tail_part_data = tmp;
-//        } else {
-//          tail_part_size = 0;
-//          tail_part_data.clear();
-//          tail_part_offset = 0;
-//        }
-//      }
-//    } else {
-//      if (tail_part_size == 0) {
-//        return 0; /* nothing more to write */
-//      }
-//
-//      /* flush watever tail data is present */
-////      int ret = parent_op.write_data(dpp, tail_part_data, tail_part_offset);
-////      if (ret < 0) {
-////        return ret;
-////      }
-//      tail_part_size = 0;
-//      tail_part_data.clear();
-//      tail_part_offset = 0;
-//    }
+    bs = obj.get_optimal_bs(left);
+    for (p = data.c_str(); left > 0; left -= bs, p += bs, offset += bs) {
+      if (left < bs)
+        bs = left;
+      buf.ov_buf[0] = p;
+      buf.ov_vec.v_count[0] = bs;
+      ext.iv_index[0] = offset;
+      ext.iv_vec.v_count[0] = bs;
+      attr.ov_vec.v_count[0] = 0;
+
+      rc = m0_obj_op(obj.mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
+      if (rc != 0)
+        goto err;
+      m0_op_launch(&op, 1);
+      rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+           m0_rc(op);
+      m0_op_fini(op);
+      m0_op_free(op);
+      if (rc != 0)
+        goto err;
+    }
 
     return 0;
+
+  err:
+    this->cleanup();
+    return rc;
   }
 
   int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
@@ -1086,6 +1099,8 @@ namespace rgw::sal {
                          rgw_zone_set *zones_trace, bool *canceled,
                          optional_yield y)
   {
+    this->cleanup();
+
     bufferlist bl;
     rgw_bucket_dir_entry ent;
 
