@@ -520,33 +520,50 @@ namespace rgw::sal {
 
   int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max, ListResults& results, optional_yield y)
   {
-    int ret = 0;
+    int rc;
+    vector<string> key_vec(max);
+    vector<bufferlist> val_vec(max);
+    bool is_truncated = false;
 
-//    results.objs.clear();
-//
-//    Motr::Bucket target(store->getDB(), get_info());
-//    Motr::Bucket::List list_op(&target);
-//
-//    list_op.params.prefix = params.prefix;
-//    list_op.params.delim = params.delim;
-//    list_op.params.marker = params.marker;
-//    list_op.params.ns = params.ns;
-//    list_op.params.end_marker = params.end_marker;
-//    list_op.params.ns = params.ns;
-//    list_op.params.enforce_ns = params.enforce_ns;
-//    list_op.params.access_list_filter = params.access_list_filter;
-//    list_op.params.force_check_filter = params.force_check_filter;
-//    list_op.params.list_versions = params.list_versions;
-//    list_op.params.allow_unordered = params.allow_unordered;
-//
-//    results.objs.clear();
-//    ret = list_op.list_objects(dpp, max, &results.objs, &results.common_prefixes, &results.is_truncated);
-//    if (ret >= 0) {
-//      results.next_marker = list_op.get_next_marker();
-//      params.marker = results.next_marker;
-//    }
+    // Retrieve all `max` number of pairs.
+    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
+    key_vec[0].clear();
+    rc = store->next_query_by_name(bucket_index_iname, key_vec, val_vec);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      return rc;
+    }
 
-    return ret;
+    // Process the returned pairs to add into ListResults.
+    // The POC can only support listing all objects or selecting
+    // with prefix.
+    uint64_t ocount = 0;
+    for (const auto& bl: val_vec) {
+      if (bl.length() == 0)
+        break;
+
+      rgw_bucket_dir_entry ent;
+      auto iter = bl.cbegin();
+      ent.decode(iter);
+
+      if (params.prefix.size() &&
+          (0 != ent.key.name.compare(0, params.prefix.size(), params.prefix))) {
+        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+          ": skippping \"" << ent.key <<
+          "\" because doesn't match prefix" << dendl;
+        continue;
+      }
+
+      results.objs.emplace_back(std::move(ent));
+      ocount++;
+      if (ocount == max) {
+          is_truncated = true;
+	  break;
+      }
+    }
+    results.is_truncated = is_truncated;
+
+    return 0;
   }
 
   int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
@@ -806,12 +823,96 @@ namespace rgw::sal {
 
   int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
   {
-    return 0;
+    // Open the object here.
+    return source->open_mobj(dpp);
   }
 
   int MotrObject::MotrReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
   {
     return 0;
+  }
+
+  // RGWGetObj::execute() calls ReadOp::iterate() to read object from 'ofs' to 'end'.
+  // The returned data is processed in 'cb' which is a chain of post-processing
+  // filters such as decompression, de-encryption and sending back data to client
+  // (RGWGetObj_CB::handle_dta which in turn calls RGWGetObj::get_data_cb() to
+  // send data back.).
+  //
+  // POC implements a simple sync version of iterate() function in which it reads
+  // a block of data each time and call 'cb' for post-processing.
+  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
+  {
+
+    int rc;
+    unsigned bs, actual;
+    struct m0_op *op;
+    struct m0_bufvec buf;
+    struct m0_bufvec attr;
+    struct m0_indexvec ext;
+    int64_t obj_size = end - ofs + 1; //TODO
+
+    // As `ofs` may not be parity group size aligned, even using optimal
+    // buffer block size, simply reading data from offset `ofs` could come
+    // across parity group boundary. And Motr only allows page-size aligned
+    // offset.
+    //
+    // The optimal size of each IO should also take into account the data
+    // transfer size to s3 client. For example, 16MB may be nice to read
+    // data from motr, but it could be too big for network transfer. 
+    //
+    // TODO: We leave proper handling of offset in the future.
+    bs = source->get_optimal_bs(end - ofs + 1);
+
+    rc = m0_bufvec_empty_alloc(&buf, 1) ? :
+         m0_bufvec_alloc(&attr, 1, 1) ? :
+         m0_indexvec_alloc(&ext, 1);
+    if (rc < 0)
+      goto out;
+
+    end = end < obj_size ? end : obj_size;
+    while (ofs <= end) {
+      if (end - ofs + 1 < bs)
+          actual = end - ofs + 1;
+      else
+	  actual = bs;
+
+      buf.ov_buf[0] = new char[bs];
+      buf.ov_vec.v_count[0] = bs;
+      ext.iv_index[0] = ofs;
+      ext.iv_vec.v_count[0] = bs;
+      attr.ov_vec.v_count[0] = 0;
+
+      // Read from Motr.
+      rc = m0_obj_op(source->mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
+      if (rc != 0)
+        goto out;
+      m0_op_launch(&op, 1);
+      rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+           m0_rc(op);
+      m0_op_fini(op);
+      m0_op_free(op);
+      if (rc != 0)
+        goto out;
+
+      // Call `cb` to process returned data.
+      bufferlist bl;
+      bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual); 
+      cb->handle_data(bl, ofs, actual); 
+
+      // Free memory.
+      delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
+      buf.ov_buf[0] = NULL;
+
+      ofs += actual;
+    }
+
+  out:
+    m0_indexvec_free(&ext);
+    m0_bufvec_free(&attr);
+    m0_bufvec_free2(&buf);
+    source->close_mobj();
+    return rc;
+
   }
 
   int MotrObject::MotrReadOp::get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y)
@@ -886,11 +987,6 @@ namespace rgw::sal {
         return 0;
   }
 
-  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
-  {
-    return 0;
-  }
-
   int MotrObject::swift_versioning_restore(RGWObjectCtx* obj_ctx,
       bool& restored,
       const DoutPrefixProvider* dpp)
@@ -926,12 +1022,8 @@ namespace rgw::sal {
     return 0;
   }
 
-  int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+  void MotrObject::obj_name_to_motr_fid(struct m0_uint128 *obj_fid)
   {
-    if (mobj != NULL) {
-      ldpp_dout(dpp, 0) << "ERROR: object is already opened" << dendl;
-      return -EINVAL;
-    }
     // calculate FID from the object name (key) and its bucket marker
     MD5 hash;
     // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
@@ -944,8 +1036,19 @@ namespace rgw::sal {
 		this->get_bucket()->get_name().length());
     unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
     hash.Final(md5);
+
+    memcpy(obj_fid, md5, sizeof *obj_fid);
+  }
+
+  int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+  {
+    if (mobj != NULL) {
+      ldpp_dout(dpp, 0) << "ERROR: object is already opened" << dendl;
+      return -EINVAL;
+    }
+
     struct m0_uint128 obj_fid;
-    memcpy(&obj_fid, md5, sizeof obj_fid);
+    this->obj_name_to_motr_fid(&obj_fid);
 
     int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
     M0_ASSERT(lid > 0);
@@ -971,6 +1074,36 @@ namespace rgw::sal {
     }
 
     layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+
+    return rc;
+  }
+
+  int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
+  {
+    struct m0_uint128 obj_fid;
+    this->obj_name_to_motr_fid(&obj_fid);
+
+    mobj = new (struct m0_obj);
+    m0_obj_init(mobj, &store->container.co_realm, &obj_fid,
+                store->conf.mc_layout_id);
+
+    struct m0_op *op = NULL;
+    int rc = m0_entity_open( &mobj->ob_entity, &op);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: " << rc << dendl;
+      return rc;
+    }
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+  
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
+      delete mobj;
+      mobj = NULL;
+    }
 
     return rc;
   }
@@ -1130,6 +1263,7 @@ namespace rgw::sal {
     // and RGWRados::Object::Write::write_meta() in rgw_rados.cc for what and
     // how to set the dir entry. Only set the basic ones for POC, no ACLs and
     // other attrs.
+    obj.get_key().get_index_key(&ent.key);
     ent.meta.size = total_data_size;
     ent.meta.accounted_size = total_data_size;
     ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
