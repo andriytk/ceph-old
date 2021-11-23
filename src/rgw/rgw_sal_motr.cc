@@ -948,10 +948,10 @@ namespace rgw::sal {
     int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
     M0_ASSERT(lid > 0);
 
-    mobj = new (struct m0_obj);
+    mobj = new (struct m0_obj)();
     m0_obj_init(mobj, &store->container.co_realm, &obj_fid, lid);
 
-    struct m0_op *op;
+    struct m0_op *op = NULL;
     int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
     if (rc != 0) {
       ldpp_dout(dpp, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
@@ -1037,7 +1037,8 @@ namespace rgw::sal {
     int rc;
     unsigned bs, left;
     struct m0_op *op;
-    char *p;
+    char *start, *p;
+    bufferlist cdata, cdata_tail;
 
     left = data.length();
 
@@ -1062,15 +1063,29 @@ namespace rgw::sal {
     total_data_size += left;
 
     bs = obj.get_optimal_bs(left);
-    for (p = data.c_str(); left > 0; left -= bs, p += bs, offset += bs) {
-      if (left < bs)
-        bs = left;
+    ldpp_dout(dpp, 0) << "DEBUG: left=" << left << " bs=" << bs << dendl;
+
+    if (!data.is_contiguous())
+      data.splice(0, left, &cdata);
+    else
+      cdata = data;
+
+    start = cdata.c_str();
+
+    for (p = start; left > 0; left -= bs, p += bs, offset += bs) {
+      if (left < bs) {
+        cdata.append_zero(bs - left);
+        left = bs;
+        cdata.splice(p - start, bs, &cdata_tail);
+        p = cdata_tail.c_str();
+      }
       buf.ov_buf[0] = p;
       buf.ov_vec.v_count[0] = bs;
       ext.iv_index[0] = offset;
       ext.iv_vec.v_count[0] = bs;
       attr.ov_vec.v_count[0] = 0;
 
+      op = NULL;
       rc = m0_obj_op(obj.mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
       if (rc != 0)
         goto err;
@@ -1545,7 +1560,7 @@ namespace rgw::sal {
       return 0; // nothing to do more
 
     // create index or make sure it's created
-    struct m0_op *op;
+    struct m0_op *op = NULL;
     int rc = m0_entity_create(NULL, &idx->in_entity, &op);
     if (rc != 0) {
       ldout(cctx, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
