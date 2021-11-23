@@ -495,9 +495,9 @@ protected:
     protected:
     rgw::sal::MotrStore* store;
     const rgw_user& owner;
-	const rgw_placement_rule *ptail_placement_rule;
-	uint64_t olh_epoch;
-	const string& unique_tag;
+    const rgw_placement_rule *ptail_placement_rule;
+    uint64_t olh_epoch;
+    const string& unique_tag;
     MotrObject obj;
     uint64_t total_data_size = 0; /* for total data being uploaded */
     bufferlist head_data;

@@ -1099,24 +1099,29 @@ namespace rgw::sal {
                          rgw_zone_set *zones_trace, bool *canceled,
                          optional_yield y)
   {
-//    parent_op.meta.mtime = mtime;
-//    parent_op.meta.delete_at = delete_at;
-//    parent_op.meta.if_match = if_match;
-//    parent_op.meta.if_nomatch = if_nomatch;
-//    parent_op.meta.user_data = user_data;
-//    parent_op.meta.zones_trace = zones_trace;
-//
-//    /* XXX: handle accounted size */
-//    accounted_size = total_data_size;
-//    int ret = parent_op.write_meta(dpp, total_data_size, accounted_size, attrs);
-//    if (canceled) {
-//      *canceled = parent_op.meta.canceled;
-//    }
-
     this->cleanup();
 
-    return 0;
+    bufferlist bl;
+    rgw_bucket_dir_entry ent;
 
+    // Set rgw_bucet_dir_entry. Some of the member of this structure may not
+    // apply to motr. For example the storage_class.
+    //
+    // Checkout AtomicObjectProcessor::complete() in rgw_putobj_processor.cc
+    // and RGWRados::Object::Write::write_meta() in rgw_rados.cc for what and
+    // how to set the dir entry. Only set the basic ones for POC, no ACLs and
+    // other attrs.
+    ent.meta.size = total_data_size;
+    ent.meta.accounted_size = total_data_size;
+    ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
+    if (user_data)
+      ent.meta.user_data = *user_data;
+    ent.encode(bl);
+
+    // Insert an entry into bucket index.
+    string bucket_index_iname = "motr.rgw.bucket.index." + obj.get_bucket()->get_name();
+    return store->do_idx_op_by_name(bucket_index_iname,
+                                    M0_IC_PUT, obj.get_key().to_str(), bl);
   }
 
   std::unique_ptr<RGWRole> MotrStore::get_role(std::string name,
