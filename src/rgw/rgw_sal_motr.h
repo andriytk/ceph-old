@@ -32,8 +32,12 @@ extern "C" {
 }
 
 #include "rgw_sal.h"
+#include "rgw_rados.h"
+#include "rgw_notify.h"
 #include "rgw_oidc_provider.h"
 #include "rgw_role.h"
+#include "rgw_multi.h"
+#include "rgw_putobj_processor.h"
 
 namespace rgw { namespace sal {
 
@@ -540,6 +544,83 @@ protected:
                          optional_yield y) override;
     void cleanup();
   };
+
+class MotrMultipartWriter : public Writer {
+protected:
+  rgw::sal::MotrStore* store;
+
+public:
+  MotrMultipartWriter(const DoutPrefixProvider *dpp,
+		       optional_yield y, MultipartUpload* upload,
+		       std::unique_ptr<rgw::sal::Object> _head_obj,
+		       MotrStore* _store,
+		       const rgw_user& owner, RGWObjectCtx& obj_ctx,
+		       const rgw_placement_rule *ptail_placement_rule,
+		       uint64_t part_num, const std::string& part_num_str) :
+				  Writer(dpp, y),
+				  store(_store)
+  {}
+  ~MotrMultipartWriter() = default;
+
+  // prepare to start processing object data
+  virtual int prepare(optional_yield y) override;
+
+  // Process a bufferlist
+  virtual int process(bufferlist&& data, uint64_t offset) override;
+
+  // complete the operation and make its result visible to clients
+  virtual int complete(size_t accounted_size, const std::string& etag,
+                       ceph::real_time *mtime, ceph::real_time set_mtime,
+                       std::map<std::string, bufferlist>& attrs,
+                       ceph::real_time delete_at,
+                       const char *if_match, const char *if_nomatch,
+                       const std::string *user_data,
+                       rgw_zone_set *zones_trace, bool *canceled,
+                       optional_yield y) override;
+};
+
+class MotrMultipartUpload : public MultipartUpload {
+  MotrStore* store;
+  RGWMPObj mp_obj;
+  ceph::real_time mtime;
+  rgw_placement_rule placement;
+  RGWObjManifest manifest;
+
+public:
+  MotrMultipartUpload(MotrStore* _store, Bucket* _bucket, const std::string& oid, std::optional<std::string> upload_id, ceph::real_time _mtime) : MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), mtime(_mtime) {}
+  virtual ~MotrMultipartUpload() = default;
+
+  virtual const std::string& get_meta() const { return mp_obj.get_meta(); }
+  virtual const std::string& get_key() const { return mp_obj.get_key(); }
+  virtual const std::string& get_upload_id() const { return mp_obj.get_upload_id(); }
+  virtual ceph::real_time& get_mtime() { return mtime; }
+  virtual std::unique_ptr<rgw::sal::Object> get_meta_obj() override;
+  virtual int init(const DoutPrefixProvider* dpp, optional_yield y, RGWObjectCtx* obj_ctx, ACLOwner& owner, rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs) override;
+  virtual int list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
+			 int num_parts, int marker,
+			 int* next_marker, bool* truncated,
+			 bool assume_unsorted = false) override;
+  virtual int abort(const DoutPrefixProvider* dpp, CephContext* cct,
+		    RGWObjectCtx* obj_ctx) override;
+  virtual int complete(const DoutPrefixProvider* dpp,
+		       optional_yield y, CephContext* cct,
+		       std::map<int, std::string>& part_etags,
+		       std::list<rgw_obj_index_key>& remove_objs,
+		       uint64_t& accounted_size, bool& compressed,
+		       RGWCompressionInfo& cs_info, off_t& ofs,
+		       std::string& tag, ACLOwner& owner,
+		       uint64_t olh_epoch,
+		       rgw::sal::Object* target_obj,
+		       RGWObjectCtx* obj_ctx) override;
+  virtual int get_info(const DoutPrefixProvider *dpp, optional_yield y, RGWObjectCtx* obj_ctx, rgw_placement_rule** rule, rgw::sal::Attrs* attrs = nullptr) override;
+  virtual std::unique_ptr<Writer> get_writer(const DoutPrefixProvider *dpp,
+			  optional_yield y,
+			  std::unique_ptr<rgw::sal::Object> _head_obj,
+			  const rgw_user& owner, RGWObjectCtx& obj_ctx,
+			  const rgw_placement_rule *ptail_placement_rule,
+			  uint64_t part_num,
+			  const std::string& part_num_str) override;
+};
 
   class MotrStore : public Store {
     private:

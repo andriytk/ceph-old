@@ -35,6 +35,8 @@ extern "C" {
 
 #define dout_subsys ceph_subsys_rgw
 
+static string mp_ns = RGW_OBJ_NS_MULTIPART;
+
 namespace rgw::sal {
 
   // TODO: properly handle the number of key/value pairs to get in
@@ -580,13 +582,15 @@ namespace rgw::sal {
 				const int& max_uploads,
 				vector<std::unique_ptr<MultipartUpload>>& uploads,
 				map<string, bool> *common_prefixes,
-				bool *is_truncated) {
+				bool *is_truncated)
+  {
     return 0;
   }
 
   int MotrBucket::abort_multiparts(const DoutPrefixProvider *dpp,
 				 CephContext *cct,
-				 string& prefix, string& delim) {
+				 string& prefix, string& delim)
+  {
     return 0;
   }
 
@@ -1291,6 +1295,86 @@ namespace rgw::sal {
                                     M0_IC_PUT, obj.get_key().to_str(), bl);
   }
 
+int MotrMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
+                                RGWObjectCtx *obj_ctx)
+{
+  return 0; // TODO implement
+}
+
+std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
+{
+  return bucket->get_object(rgw_obj_key(get_meta(), string(), mp_ns));
+}
+
+int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y, RGWObjectCtx* obj_ctx, ACLOwner& owner, rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs)
+{
+  return 0;
+}
+
+int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *cct,
+				     int num_parts, int marker,
+				     int *next_marker, bool *truncated,
+				     bool assume_unsorted)
+{
+  return 0; // TODO implement
+}
+
+int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
+				   optional_yield y, CephContext* cct,
+				   map<int, string>& part_etags,
+				   list<rgw_obj_index_key>& remove_objs,
+				   uint64_t& accounted_size, bool& compressed,
+				   RGWCompressionInfo& cs_info, off_t& ofs,
+				   std::string& tag, ACLOwner& owner,
+				   uint64_t olh_epoch,
+				   rgw::sal::Object* target_obj,
+				   RGWObjectCtx* obj_ctx)
+{
+  return 0; // TODO implement
+}
+
+int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield y, RGWObjectCtx* obj_ctx, rgw_placement_rule** rule, rgw::sal::Attrs* attrs)
+{
+  return 0; // TODO implement
+}
+
+std::unique_ptr<Writer> MotrMultipartUpload::get_writer(
+				  const DoutPrefixProvider *dpp,
+				  optional_yield y,
+				  std::unique_ptr<rgw::sal::Object> _head_obj,
+				  const rgw_user& owner, RGWObjectCtx& obj_ctx,
+				  const rgw_placement_rule *ptail_placement_rule,
+				  uint64_t part_num,
+				  const std::string& part_num_str)
+{
+  return std::make_unique<MotrMultipartWriter>(dpp, y, this,
+				 std::move(_head_obj), store, owner,
+				 obj_ctx, ptail_placement_rule, part_num, part_num_str);
+}
+
+int MotrMultipartWriter::prepare(optional_yield y)
+{
+  return 0;
+}
+
+int MotrMultipartWriter::process(bufferlist&& data, uint64_t offset)
+{
+  return 0;
+}
+
+int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag,
+                       ceph::real_time *mtime, ceph::real_time set_mtime,
+                       std::map<std::string, bufferlist>& attrs,
+                       ceph::real_time delete_at,
+                       const char *if_match, const char *if_nomatch,
+                       const std::string *user_data,
+                       rgw_zone_set *zones_trace, bool *canceled,
+                       optional_yield y)
+{
+  return 0;
+}
+
+
   std::unique_ptr<RGWRole> MotrStore::get_role(std::string name,
       std::string tenant,
       std::string path,
@@ -1331,7 +1415,7 @@ namespace rgw::sal {
   }
 
   std::unique_ptr<MultipartUpload> MotrStore::get_multipart_upload(Bucket* bucket, const std::string& oid, std::optional<std::string> upload_id, ceph::real_time mtime) {
-    return nullptr;
+    return std::make_unique<MotrMultipartUpload>(this, bucket, oid, upload_id, mtime);
   }
 
   std::unique_ptr<Writer> MotrStore::get_append_writer(const DoutPrefixProvider *dpp,
