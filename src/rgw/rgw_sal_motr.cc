@@ -163,7 +163,7 @@ namespace rgw::sal {
   int MotrUser::load_user(const DoutPrefixProvider *dpp,
                           optional_yield y)
   {
-
+    ldpp_dout(dpp, 0) << "load user: user id =   " << info.user_id.to_str() << dendl;
     return load_user_from_idx(dpp, store, info, &attrs, &objv_tracker);
   }
 
@@ -268,9 +268,10 @@ namespace rgw::sal {
     bufferlist bl;
     struct MotrBucketInfo mbinfo;
 
+    ldpp_dout(dpp, 0) << "put_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
     mbinfo.info = info;
     mbinfo.bucket_attrs = attrs;
-    //mbinfo.mtime = ;
+    mbinfo.mtime = ceph::real_time();
     mbinfo.bucket_version = bucket_version;
     mbinfo.encode(bl);
 
@@ -285,7 +286,6 @@ namespace rgw::sal {
     // Get bucket instance using bucket's name (string). or bucket id?
     bufferlist bl;
     ldpp_dout(dpp, 0) << "get_bucket_info(): bucket name  = " << info.bucket.name << dendl;
-    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
     int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
                                       M0_IC_GET, info.bucket.name, bl);
     ldpp_dout(dpp, 0) << "get_bucket_info(): rc  = " << rc << dendl;
@@ -296,7 +296,14 @@ namespace rgw::sal {
     bufferlist& blr = bl;
     auto iter =blr.cbegin();
     mbinfo.decode(iter); //Decode into MotrBucketInfo.
+
     info = mbinfo.info;
+    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
+    rgw_placement_rule placement_rule;
+    placement_rule.name = "default";
+    placement_rule.storage_class = "STANDARD";
+    info.placement_rule = placement_rule;
+
     attrs = mbinfo.bucket_attrs;
     mtime = mbinfo.mtime;
     bucket_version = mbinfo.bucket_version;
@@ -520,33 +527,50 @@ namespace rgw::sal {
 
   int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max, ListResults& results, optional_yield y)
   {
-    int ret = 0;
+    int rc;
+    vector<string> key_vec(max);
+    vector<bufferlist> val_vec(max);
+    bool is_truncated = false;
 
-//    results.objs.clear();
-//
-//    Motr::Bucket target(store->getDB(), get_info());
-//    Motr::Bucket::List list_op(&target);
-//
-//    list_op.params.prefix = params.prefix;
-//    list_op.params.delim = params.delim;
-//    list_op.params.marker = params.marker;
-//    list_op.params.ns = params.ns;
-//    list_op.params.end_marker = params.end_marker;
-//    list_op.params.ns = params.ns;
-//    list_op.params.enforce_ns = params.enforce_ns;
-//    list_op.params.access_list_filter = params.access_list_filter;
-//    list_op.params.force_check_filter = params.force_check_filter;
-//    list_op.params.list_versions = params.list_versions;
-//    list_op.params.allow_unordered = params.allow_unordered;
-//
-//    results.objs.clear();
-//    ret = list_op.list_objects(dpp, max, &results.objs, &results.common_prefixes, &results.is_truncated);
-//    if (ret >= 0) {
-//      results.next_marker = list_op.get_next_marker();
-//      params.marker = results.next_marker;
-//    }
+    // Retrieve all `max` number of pairs.
+    string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
+    key_vec[0].clear();
+    rc = store->next_query_by_name(bucket_index_iname, key_vec, val_vec);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      return rc;
+    }
 
-    return ret;
+    // Process the returned pairs to add into ListResults.
+    // The POC can only support listing all objects or selecting
+    // with prefix.
+    uint64_t ocount = 0;
+    for (const auto& bl: val_vec) {
+      if (bl.length() == 0)
+        break;
+
+      rgw_bucket_dir_entry ent;
+      auto iter = bl.cbegin();
+      ent.decode(iter);
+
+      if (params.prefix.size() &&
+          (0 != ent.key.name.compare(0, params.prefix.size(), params.prefix))) {
+        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+          ": skippping \"" << ent.key <<
+          "\" because doesn't match prefix" << dendl;
+        continue;
+      }
+
+      results.objs.emplace_back(std::move(ent));
+      ocount++;
+      if (ocount == max) {
+          is_truncated = true;
+	  break;
+      }
+    }
+    results.is_truncated = is_truncated;
+
+    return 0;
   }
 
   int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
@@ -806,7 +830,9 @@ namespace rgw::sal {
 
   int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
   {
-    return 0;
+    // Open the object here.
+    ldpp_dout(dpp, 0) << "MotrReadOp::prepare: open object. " << dendl;
+    return source->open_mobj(dpp);
   }
 
   int MotrObject::MotrReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
@@ -814,9 +840,99 @@ namespace rgw::sal {
     return 0;
   }
 
+  // RGWGetObj::execute() calls ReadOp::iterate() to read object from 'ofs' to 'end'.
+  // The returned data is processed in 'cb' which is a chain of post-processing
+  // filters such as decompression, de-encryption and sending back data to client
+  // (RGWGetObj_CB::handle_dta which in turn calls RGWGetObj::get_data_cb() to
+  // send data back.).
+  //
+  // POC implements a simple sync version of iterate() function in which it reads
+  // a block of data each time and call 'cb' for post-processing.
+  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
+  {
+
+    int rc;
+    unsigned bs, actual;
+    struct m0_op *op;
+    struct m0_bufvec buf;
+    struct m0_bufvec attr;
+    struct m0_indexvec ext;
+    int64_t obj_size = end - ofs + 1; //TODO
+
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
+
+    // As `ofs` may not be parity group size aligned, even using optimal
+    // buffer block size, simply reading data from offset `ofs` could come
+    // across parity group boundary. And Motr only allows page-size aligned
+    // offset.
+    //
+    // The optimal size of each IO should also take into account the data
+    // transfer size to s3 client. For example, 16MB may be nice to read
+    // data from motr, but it could be too big for network transfer. 
+    //
+    // TODO: We leave proper handling of offset in the future.
+    bs = source->get_optimal_bs(end - ofs + 1);
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): optimal bs = " << bs << dendl;
+
+    rc = m0_bufvec_empty_alloc(&buf, 1) ? :
+         m0_bufvec_alloc(&attr, 1, 1) ? :
+         m0_indexvec_alloc(&ext, 1);
+    if (rc < 0)
+      goto out;
+
+    end = end < obj_size ? end : obj_size;
+    while (ofs <= end) {
+      if (end - ofs + 1 < bs)
+          actual = end - ofs + 1;
+      else
+	  actual = bs;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", actual = " << actual << dendl;
+
+      buf.ov_buf[0] = new char[bs];
+      buf.ov_vec.v_count[0] = bs;
+      ext.iv_index[0] = ofs;
+      ext.iv_vec.v_count[0] = bs;
+      attr.ov_vec.v_count[0] = 0;
+
+      // Read from Motr.
+      rc = m0_obj_op(source->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): init read op, rc = " << rc << dendl;
+      if (rc != 0)
+        goto out;
+      m0_op_launch(&op, 1);
+      rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+           m0_rc(op);
+      m0_op_fini(op);
+      m0_op_free(op);
+      if (rc != 0)
+        goto out;
+
+      // Call `cb` to process returned data.
+      bufferlist bl;
+      bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual); 
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data " << dendl;
+      cb->handle_data(bl, ofs, actual); 
+
+      // Free memory.
+      delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
+      buf.ov_buf[0] = NULL;
+
+      ofs += actual;
+    }
+
+  out:
+    m0_indexvec_free(&ext);
+    m0_bufvec_free(&attr);
+    m0_bufvec_free2(&buf);
+    source->close_mobj();
+    return rc;
+
+  }
+
   int MotrObject::MotrReadOp::get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y)
   {
-    return 0;
+    //return 0;
+    return -ENODATA;
   }
 
   std::unique_ptr<Object::DeleteOp> MotrObject::get_delete_op(RGWObjectCtx* ctx)
@@ -886,11 +1002,6 @@ namespace rgw::sal {
         return 0;
   }
 
-  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
-  {
-    return 0;
-  }
-
   int MotrObject::swift_versioning_restore(RGWObjectCtx* obj_ctx,
       bool& restored,
       const DoutPrefixProvider* dpp)
@@ -926,26 +1037,31 @@ namespace rgw::sal {
     return 0;
   }
 
-  int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+  void MotrObject::obj_name_to_motr_fid(struct m0_uint128 *obj_fid)
   {
-    if (mobj != NULL) {
-      ldpp_dout(dpp, 0) << "ERROR: object is already opened" << dendl;
-      return -EINVAL;
-    }
     // calculate FID from the object name (key) and its bucket marker
     MD5 hash;
     // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
     hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
-    ldpp_dout(dpp, 0) << "DEBUG: key=" << this->get_key().to_str() <<
-                      " bucket=" << this->get_bucket()->get_name() << dendl;
     hash.Update((const unsigned char *)this->get_key().to_str().c_str(),
 		this->get_key().to_str().length());
     hash.Update((const unsigned char *)this->get_bucket()->get_name().c_str(),
 		this->get_bucket()->get_name().length());
     unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
     hash.Final(md5);
+
+    memcpy(obj_fid, md5, sizeof *obj_fid);
+  }
+
+  int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+  {
+    if (mobj != NULL) {
+      ldpp_dout(dpp, 0) << "ERROR: object is already opened" << dendl;
+      return -EINVAL;
+    }
+
     struct m0_uint128 obj_fid;
-    memcpy(&obj_fid, md5, sizeof obj_fid);
+    this->obj_name_to_motr_fid(&obj_fid);
 
     int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
     M0_ASSERT(lid > 0);
@@ -971,6 +1087,37 @@ namespace rgw::sal {
     }
 
     layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+
+    return rc;
+  }
+
+  int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
+  {
+    struct m0_uint128 obj_fid;
+    this->obj_name_to_motr_fid(&obj_fid);
+
+    mobj = new (struct m0_obj);
+    memset(mobj, 0, sizeof *mobj);
+    m0_obj_init(mobj, &store->container.co_realm, &obj_fid,
+                store->conf.mc_layout_id);
+
+    struct m0_op *op = NULL;
+    int rc = m0_entity_open( &mobj->ob_entity, &op);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: " << rc << dendl;
+      return rc;
+    }
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+  
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
+      delete mobj;
+      mobj = NULL;
+    }
 
     return rc;
   }
@@ -1130,6 +1277,7 @@ namespace rgw::sal {
     // and RGWRados::Object::Write::write_meta() in rgw_rados.cc for what and
     // how to set the dir entry. Only set the basic ones for POC, no ACLs and
     // other attrs.
+    obj.get_key().get_index_key(&ent.key);
     ent.meta.size = total_data_size;
     ent.meta.accounted_size = total_data_size;
     ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
@@ -1211,6 +1359,7 @@ namespace rgw::sal {
 
   std::unique_ptr<User> MotrStore::get_user(const rgw_user &u)
   {
+    ldout(cctx, 0) << "bucket's user:  " << u.to_str() << dendl;
     return std::make_unique<MotrUser>(this, u);
   }
 
@@ -1356,17 +1505,22 @@ namespace rgw::sal {
     } else {
       placement_rule.name = "default";
       placement_rule.storage_class = "STANDARD";
-      info.placement_rule = placement_rule;
-      info.bucket = b;
-      bucket = std::make_unique<MotrBucket>(this, info, u);
-      *existed = false;
+      bucket = std::make_unique<MotrBucket>(this, b, u);
       bucket->set_attrs(attrs);
+
+      *existed = false;
     }
 
     // TODO: how to handle zone and multi-site.
 
     if (!*existed) {
-        // Create a new bucket: (1) Add a key/value pair in the
+        info.placement_rule = placement_rule;
+        info.bucket = b;
+        info.owner = u->get_info().user_id;
+	info.zonegroup = zonegroup_id;
+        bucket->get_info() = info;
+
+	// Create a new bucket: (1) Add a key/value pair in the
         // bucket instance index. (2) Create a new bucket index.
         MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
         ret = mbucket->put_bucket_info(dpp, y)? :
