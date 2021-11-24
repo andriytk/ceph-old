@@ -298,17 +298,11 @@ namespace rgw::sal {
     mbinfo.decode(iter); //Decode into MotrBucketInfo.
 
     info = mbinfo.info;
-    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
-    rgw_placement_rule placement_rule;
-    placement_rule.name = "default";
-    placement_rule.storage_class = "STANDARD";
-    info.placement_rule = placement_rule;
-
     attrs = mbinfo.bucket_attrs;
     mtime = mbinfo.mtime;
     bucket_version = mbinfo.bucket_version;
 
-    return rc;
+    return 0;
   }
 
   int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
@@ -830,13 +824,35 @@ namespace rgw::sal {
 
   int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
   {
+    int rc;
+
+    // Get object's metadata (those stored in rgw_bucket_dir_entry).
+    bufferlist bl;
+    string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
+    rc = source->store->do_idx_op_by_name(bucket_index_iname,
+                                  M0_IC_GET, source->get_key().to_str(), bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+      return rc;
+    }
+
+    rgw_bucket_dir_entry ent;
+    bufferlist& blr = bl;
+    auto iter = blr.cbegin();
+    ent.decode(iter);
+ 
+    source->set_key(ent.key);
+    source->set_obj_size(ent.meta.size); 
+
+
     // Open the object here.
-    ldpp_dout(dpp, 0) << "MotrReadOp::prepare: open object. " << dendl;
+    ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object. " << dendl;
     return source->open_mobj(dpp);
   }
 
   int MotrObject::MotrReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
   {
+    ldpp_dout(dpp, 0) << "MotrReadOp::read(): sync read. " << dendl;
     return 0;
   }
 
@@ -853,11 +869,11 @@ namespace rgw::sal {
 
     int rc;
     unsigned bs, actual;
-    struct m0_op *op;
+    struct m0_op *op = NULL;
     struct m0_bufvec buf;
     struct m0_bufvec attr;
     struct m0_indexvec ext;
-    int64_t obj_size = end - ofs + 1; //TODO
+    int64_t obj_size = source->get_obj_size(); 
 
     ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
 
@@ -880,7 +896,7 @@ namespace rgw::sal {
     if (rc < 0)
       goto out;
 
-    end = end < obj_size ? end : obj_size;
+
     while (ofs <= end) {
       if (end - ofs + 1 < bs)
           actual = end - ofs + 1;
@@ -1117,9 +1133,11 @@ namespace rgw::sal {
       ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
       delete mobj;
       mobj = NULL;
+      return rc;
     }
 
-    return rc;
+    layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+    return 0;
   }
 
   void MotrObject::close_mobj()
