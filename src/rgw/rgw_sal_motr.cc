@@ -546,7 +546,7 @@ namespace rgw::sal {
     // Process the returned pairs to add into ListResults.
     // The POC can only support listing all objects or selecting
     // with prefix.
-    uint64_t ocount = 0;
+    int ocount = 0;
     for (const auto& bl: val_vec) {
       if (bl.length() == 0)
         break;
@@ -882,7 +882,6 @@ namespace rgw::sal {
     struct m0_bufvec buf;
     struct m0_bufvec attr;
     struct m0_indexvec ext;
-    int64_t obj_size = source->get_obj_size(); 
 
     ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
 
