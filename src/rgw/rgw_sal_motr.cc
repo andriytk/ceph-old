@@ -163,7 +163,7 @@ namespace rgw::sal {
   int MotrUser::load_user(const DoutPrefixProvider *dpp,
                           optional_yield y)
   {
-
+    ldpp_dout(dpp, 0) << "load user: user id =   " << info.user_id.to_str() << dendl;
     return load_user_from_idx(dpp, store, info, &attrs, &objv_tracker);
   }
 
@@ -268,9 +268,10 @@ namespace rgw::sal {
     bufferlist bl;
     struct MotrBucketInfo mbinfo;
 
+    ldpp_dout(dpp, 0) << "put_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
     mbinfo.info = info;
     mbinfo.bucket_attrs = attrs;
-    //mbinfo.mtime = ;
+    mbinfo.mtime = ceph::real_time();
     mbinfo.bucket_version = bucket_version;
     mbinfo.encode(bl);
 
@@ -285,7 +286,6 @@ namespace rgw::sal {
     // Get bucket instance using bucket's name (string). or bucket id?
     bufferlist bl;
     ldpp_dout(dpp, 0) << "get_bucket_info(): bucket name  = " << info.bucket.name << dendl;
-    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
     int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
                                       M0_IC_GET, info.bucket.name, bl);
     ldpp_dout(dpp, 0) << "get_bucket_info(): rc  = " << rc << dendl;
@@ -296,7 +296,14 @@ namespace rgw::sal {
     bufferlist& blr = bl;
     auto iter =blr.cbegin();
     mbinfo.decode(iter); //Decode into MotrBucketInfo.
+
     info = mbinfo.info;
+    ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
+    rgw_placement_rule placement_rule;
+    placement_rule.name = "default";
+    placement_rule.storage_class = "STANDARD";
+    info.placement_rule = placement_rule;
+
     attrs = mbinfo.bucket_attrs;
     mtime = mbinfo.mtime;
     bucket_version = mbinfo.bucket_version;
@@ -824,6 +831,7 @@ namespace rgw::sal {
   int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
   {
     // Open the object here.
+    ldpp_dout(dpp, 0) << "MotrReadOp::prepare: open object. " << dendl;
     return source->open_mobj(dpp);
   }
 
@@ -851,6 +859,8 @@ namespace rgw::sal {
     struct m0_indexvec ext;
     int64_t obj_size = end - ofs + 1; //TODO
 
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
+
     // As `ofs` may not be parity group size aligned, even using optimal
     // buffer block size, simply reading data from offset `ofs` could come
     // across parity group boundary. And Motr only allows page-size aligned
@@ -862,6 +872,7 @@ namespace rgw::sal {
     //
     // TODO: We leave proper handling of offset in the future.
     bs = source->get_optimal_bs(end - ofs + 1);
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): optimal bs = " << bs << dendl;
 
     rc = m0_bufvec_empty_alloc(&buf, 1) ? :
          m0_bufvec_alloc(&attr, 1, 1) ? :
@@ -875,6 +886,7 @@ namespace rgw::sal {
           actual = end - ofs + 1;
       else
 	  actual = bs;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", actual = " << actual << dendl;
 
       buf.ov_buf[0] = new char[bs];
       buf.ov_vec.v_count[0] = bs;
@@ -883,7 +895,8 @@ namespace rgw::sal {
       attr.ov_vec.v_count[0] = 0;
 
       // Read from Motr.
-      rc = m0_obj_op(source->mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
+      rc = m0_obj_op(source->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): init read op, rc = " << rc << dendl;
       if (rc != 0)
         goto out;
       m0_op_launch(&op, 1);
@@ -897,6 +910,7 @@ namespace rgw::sal {
       // Call `cb` to process returned data.
       bufferlist bl;
       bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual); 
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data " << dendl;
       cb->handle_data(bl, ofs, actual); 
 
       // Free memory.
@@ -917,7 +931,8 @@ namespace rgw::sal {
 
   int MotrObject::MotrReadOp::get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y)
   {
-    return 0;
+    //return 0;
+    return -ENODATA;
   }
 
   std::unique_ptr<Object::DeleteOp> MotrObject::get_delete_op(RGWObjectCtx* ctx)
@@ -1028,8 +1043,6 @@ namespace rgw::sal {
     MD5 hash;
     // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
     hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
-    ldpp_dout(dpp, 0) << "DEBUG: key=" << this->get_key().to_str() <<
-                      " bucket=" << this->get_bucket()->get_name() << dendl;
     hash.Update((const unsigned char *)this->get_key().to_str().c_str(),
 		this->get_key().to_str().length());
     hash.Update((const unsigned char *)this->get_bucket()->get_name().c_str(),
@@ -1084,6 +1097,7 @@ namespace rgw::sal {
     this->obj_name_to_motr_fid(&obj_fid);
 
     mobj = new (struct m0_obj);
+    memset(mobj, 0, sizeof *mobj);
     m0_obj_init(mobj, &store->container.co_realm, &obj_fid,
                 store->conf.mc_layout_id);
 
@@ -1345,6 +1359,7 @@ namespace rgw::sal {
 
   std::unique_ptr<User> MotrStore::get_user(const rgw_user &u)
   {
+    ldout(cctx, 0) << "bucket's user:  " << u.to_str() << dendl;
     return std::make_unique<MotrUser>(this, u);
   }
 
@@ -1490,17 +1505,22 @@ namespace rgw::sal {
     } else {
       placement_rule.name = "default";
       placement_rule.storage_class = "STANDARD";
-      info.placement_rule = placement_rule;
-      info.bucket = b;
-      bucket = std::make_unique<MotrBucket>(this, info, u);
-      *existed = false;
+      bucket = std::make_unique<MotrBucket>(this, b, u);
       bucket->set_attrs(attrs);
+
+      *existed = false;
     }
 
     // TODO: how to handle zone and multi-site.
 
     if (!*existed) {
-        // Create a new bucket: (1) Add a key/value pair in the
+        info.placement_rule = placement_rule;
+        info.bucket = b;
+        info.owner = u->get_info().user_id;
+	info.zonegroup = zonegroup_id;
+        bucket->get_info() = info;
+
+	// Create a new bucket: (1) Add a key/value pair in the
         // bucket instance index. (2) Create a new bucket index.
         MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
         ret = mbucket->put_bucket_info(dpp, y)? :
