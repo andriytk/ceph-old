@@ -310,7 +310,7 @@ namespace rgw::sal {
     mtime = mbinfo.mtime;
     bucket_version = mbinfo.bucket_version;
 
-    return rc;
+    return 0;
   }
 
   int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
@@ -834,13 +834,34 @@ namespace rgw::sal {
 
   int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
   {
+    int rc;
+
+    // Get object's metadata (those stored in rgw_bucket_dir_entry).
+    bufferlist bl;
+    string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
+    rc = source->store->do_idx_op_by_name(bucket_index_iname,
+                                  M0_IC_GET, source->get_key().to_str(), bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+      return rc;
+    }
+
+    rgw_bucket_dir_entry ent;
+    bufferlist& blr = bl;
+    auto iter = blr.cbegin();
+    ent.decode(iter);
+ 
+    source->set_key(ent.key);
+    source->set_obj_size(ent.meta.size); 
+
     // Open the object here.
-    ldpp_dout(dpp, 0) << "MotrReadOp::prepare: open object. " << dendl;
+    ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object. " << dendl;
     return source->open_mobj(dpp);
   }
 
   int MotrObject::MotrReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
   {
+    ldpp_dout(dpp, 0) << "MotrReadOp::read(): sync read. " << dendl;
     return 0;
   }
 
@@ -857,11 +878,11 @@ namespace rgw::sal {
 
     int rc;
     unsigned bs, actual;
-    struct m0_op *op;
+    struct m0_op *op = NULL;
     struct m0_bufvec buf;
     struct m0_bufvec attr;
     struct m0_indexvec ext;
-    int64_t obj_size = end - ofs + 1; //TODO
+    int64_t obj_size = source->get_obj_size(); 
 
     ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
 
@@ -884,7 +905,6 @@ namespace rgw::sal {
     if (rc < 0)
       goto out;
 
-    end = end < obj_size ? end : obj_size;
     while (ofs <= end) {
       if (end - ofs + 1 < bs)
           actual = end - ofs + 1;
