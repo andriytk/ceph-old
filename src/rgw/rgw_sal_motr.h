@@ -492,6 +492,7 @@ protected:
       bool is_opened() { return mobj != NULL; }
       int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
       int open_mobj(const DoutPrefixProvider *dpp);
+      int delete_mobj(const DoutPrefixProvider *dpp);
       void close_mobj();
       unsigned get_optimal_bs(unsigned len);
       void obj_name_to_motr_fid(struct m0_uint128 *obj_fid);
