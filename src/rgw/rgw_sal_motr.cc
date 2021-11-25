@@ -850,7 +850,15 @@ namespace rgw::sal {
     bufferlist& blr = bl;
     auto iter = blr.cbegin();
     ent.decode(iter);
- 
+
+    // Set source object's attrs. The attrs is key/value map and is used
+    // in send_response_data() to set attributes, including etag.
+    bufferlist etag_bl;
+    string& etag = ent.meta.etag;
+    ldpp_dout(dpp, 0) << "object's etag:  " << ent.meta.etag << dendl;
+    etag_bl.append(etag.c_str(), etag.size());
+    source->get_attrs().emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
+
     source->set_key(ent.key);
     source->set_obj_size(ent.meta.size); 
 
@@ -1306,6 +1314,8 @@ namespace rgw::sal {
     ent.meta.size = total_data_size;
     ent.meta.accounted_size = total_data_size;
     ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
+    ent.meta.etag = etag;
+    ldpp_dout(dpp, 0) << "object's etag:  " << etag << dendl;
     if (user_data)
       ent.meta.user_data = *user_data;
     ent.encode(bl);
