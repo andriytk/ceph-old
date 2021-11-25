@@ -657,11 +657,40 @@ namespace rgw::sal {
 
   int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, RGWObjState **state, optional_yield y, bool follow_olh)
   {
-//    if (!*state) {
-//      *state = new RGWObjState();
-//    }
-//    Motr::Object op_target(store->getDB(), get_bucket()->get_info(), get_obj());
-//    return op_target.get_obj_state(dpp, get_bucket()->get_info(), get_obj(), follow_olh, state);
+    if (!*state) {
+      *state = new RGWObjState();
+    }
+
+    // Get object's metadata (those stored in rgw_bucket_dir_entry).
+    bufferlist bl;
+    string bucket_index_iname = "motr.rgw.bucket.index." + this->get_bucket()->get_name();
+    int rc = this->store->do_idx_op_by_name(bucket_index_iname,
+                                  M0_IC_GET, this->get_key().to_str(), bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+      return rc;
+    }
+
+    rgw_bucket_dir_entry ent;
+    bufferlist& blr = bl;
+    auto iter = blr.cbegin();
+    ent.decode(iter);
+
+    // Set object state.
+    RGWObjState *s = *state;
+    s->obj = get_obj();
+    s->exists = true;
+    s->size = ent.meta.size;
+    s->accounted_size = ent.meta.size;
+    s->mtime = ent.meta.mtime;
+
+    s->has_attrs = true;
+    bufferlist etag_bl;
+    string& etag = ent.meta.etag;
+    ldpp_dout(dpp, 0) << "object's etag:  " << ent.meta.etag << dendl;
+    etag_bl.append(etag.c_str(), etag.size());
+    s->attrset.emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
+
     return 0;
   }
 
@@ -978,21 +1007,49 @@ namespace rgw::sal {
     rctx(_rctx)
   { }
 
+  // Implementation of DELETE OBJ also requires MotrObject::get_obj_state()
+  // to retrieve and set object's state from object's metadata.
+  //
+  // TODO:
+  // (1) The POC only remove the object's entry from bucket index and delete
+  // corresponding Motr objects. It doesn't handle the DeleteOp::params. 
+  // Delete::delete_obj() in rgw_rados.cc shows how rados backend process the
+  // params.
+  //
+  // (2) How to delete objects created by multipart upload?
   int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional_yield y)
   {
+    ldpp_dout(dpp, 0) << "delete  " << source->get_key().to_str() << "from " << source->get_bucket()->get_name() << dendl;
+
+    // Delete the object's entry from the bucket index.
+    bufferlist bl;
+    string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
+    int rc = source->store->do_idx_op_by_name(bucket_index_iname,
+                                              M0_IC_DEL, source->get_key().to_str(), bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to del object's entry from bucket index. " << dendl;
+      return rc;
+    }
+
+    // Remove the motr object.
+    rc = source->delete_mobj(dpp);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
+      return rc;
+    }
+      
+    //result.delete_marker = parent_op.result.delete_marker;
+    //result.version_id = parent_op.result.version_id;
     return 0;
   }
 
   int MotrObject::delete_object(const DoutPrefixProvider* dpp, RGWObjectCtx* obj_ctx, optional_yield y, bool prevent_versioning)
   {
-//    Motr::Object del_target(/*store->getDB()*/NULL, bucket->get_info(), *obj_ctx, get_obj());
-//    Motr::Object::Delete del_op(&del_target);
-//
-//    del_op.params.bucket_owner = bucket->get_info().owner;
-//    del_op.params.versioning_status = bucket->get_info().versioning_status();
-//
-//    return del_op.delete_obj(dpp);
-    return 0;
+    MotrObject::MotrDeleteOp del_op(this, obj_ctx);
+    del_op.params.bucket_owner = bucket->get_info().owner;
+    del_op.params.versioning_status = bucket->get_info().versioning_status();
+
+    return del_op.delete_obj(dpp, y);
   }
 
   int MotrObject::delete_obj_aio(const DoutPrefixProvider* dpp, RGWObjState* astate,
@@ -1154,6 +1211,42 @@ namespace rgw::sal {
     }
 
     layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+    return 0;
+  }
+
+  int MotrObject::delete_mobj(const DoutPrefixProvider *dpp)
+  {
+    int rc;
+
+    // Open the object.
+    if (mobj == NULL) {
+      rc = this->open_mobj(dpp);
+      if (rc < 0)
+        return rc;
+    }
+
+    // Create an DELETE op and execute it (sync version).
+    struct m0_op *op = NULL;
+    rc = m0_entity_delete( &mobj->ob_entity, &op);
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: m0_entity_delete() failed: " << rc << dendl;
+      return rc;
+    }
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+ 
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
+      return rc;
+    }
+
+    // Clean up.
+    delete mobj;
+    mobj = NULL;
+    layout_id = 0; 
     return 0;
   }
 
@@ -2011,6 +2104,7 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
 
     // Only the first element for key_vec needs to be set for NEXT query.
     // The key_vec will be set will the returned keys from motr index.
+    ldout(cctx, 0) << "index name  = " << idx_name << dendl;
     key_vec[0].assign(key_str_vec[0].begin(), key_str_vec[0].end());
     ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key_vec[0].data()) << dendl;
     rc = do_idx_next_op(&idx, key_vec, val_vec);
