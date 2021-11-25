@@ -867,13 +867,13 @@ namespace rgw::sal {
     return source->open_mobj(dpp);
   }
 
-  int MotrObject::MotrReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
+  int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
   {
     ldpp_dout(dpp, 0) << "MotrReadOp::read(): sync read. " << dendl;
     return 0;
   }
 
-  // RGWGetObj::execute() calls ReadOp::iterate() to read object from 'ofs' to 'end'.
+  // RGWGetObj::execute() calls ReadOp::iterate() to read object from 'off' to 'end'.
   // The returned data is processed in 'cb' which is a chain of post-processing
   // filters such as decompression, de-encryption and sending back data to client
   // (RGWGetObj_CB::handle_dta which in turn calls RGWGetObj::get_data_cb() to
@@ -881,7 +881,7 @@ namespace rgw::sal {
   //
   // POC implements a simple sync version of iterate() function in which it reads
   // a block of data each time and call 'cb' for post-processing.
-  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
+  int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off, int64_t end, RGWGetDataCB* cb, optional_yield y)
   {
 
     int rc;
@@ -891,10 +891,10 @@ namespace rgw::sal {
     struct m0_bufvec attr;
     struct m0_indexvec ext;
 
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", end = " << end << dendl;
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off =  " << off << ", end = " << end << dendl;
 
-    // As `ofs` may not be parity group size aligned, even using optimal
-    // buffer block size, simply reading data from offset `ofs` could come
+    // As `off` may not be parity group size aligned, even using optimal
+    // buffer block size, simply reading data from offset `off` could come
     // across parity group boundary. And Motr only allows page-size aligned
     // offset.
     //
@@ -903,7 +903,7 @@ namespace rgw::sal {
     // data from motr, but it could be too big for network transfer. 
     //
     // TODO: We leave proper handling of offset in the future.
-    bs = source->get_optimal_bs(end - ofs + 1);
+    bs = source->get_optimal_bs(end - off + 1);
     ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): optimal bs = " << bs << dendl;
 
     rc = m0_bufvec_empty_alloc(&buf, 1) ? :
@@ -912,16 +912,16 @@ namespace rgw::sal {
     if (rc < 0)
       goto out;
 
-    while (ofs <= end) {
-      if (end - ofs + 1 < bs)
-          actual = end - ofs + 1;
+    while (off <= end) {
+      if (end - off + 1 < bs)
+          actual = end - off + 1;
       else
 	  actual = bs;
-      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): ofs =  " << ofs << ", actual = " << actual << dendl;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off =  " << off << ", actual = " << actual << dendl;
 
       buf.ov_buf[0] = new char[bs];
       buf.ov_vec.v_count[0] = bs;
-      ext.iv_index[0] = ofs;
+      ext.iv_index[0] = off;
       ext.iv_vec.v_count[0] = bs;
       attr.ov_vec.v_count[0] = 0;
 
@@ -942,13 +942,13 @@ namespace rgw::sal {
       bufferlist bl;
       bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual); 
       ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data " << dendl;
-      cb->handle_data(bl, ofs, actual); 
+      cb->handle_data(bl, off, actual);
 
       // Free memory.
       delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
       buf.ov_buf[0] = NULL;
 
-      ofs += actual;
+      off += actual;
     }
 
   out:
@@ -1355,7 +1355,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
 				   map<int, string>& part_etags,
 				   list<rgw_obj_index_key>& remove_objs,
 				   uint64_t& accounted_size, bool& compressed,
-				   RGWCompressionInfo& cs_info, off_t& ofs,
+				   RGWCompressionInfo& cs_info, off_t& off,
 				   std::string& tag, ACLOwner& owner,
 				   uint64_t olh_epoch,
 				   rgw::sal::Object* target_obj,
