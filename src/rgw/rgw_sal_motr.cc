@@ -1140,9 +1140,11 @@ namespace rgw::sal {
       ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
       delete mobj;
       mobj = NULL;
+      return rc;
     }
-
-    return rc;
+	 
+    layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+    return 0;
   }
 
   void MotrObject::close_mobj()
