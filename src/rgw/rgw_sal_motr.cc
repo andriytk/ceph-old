@@ -842,7 +842,7 @@ namespace rgw::sal {
     rc = source->store->do_idx_op_by_name(bucket_index_iname,
                                   M0_IC_GET, source->get_key().to_str(), bl);
     if (rc < 0) {
-      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index." << dendl;
       return rc;
     }
 
@@ -886,13 +886,17 @@ namespace rgw::sal {
 
     int rc;
     unsigned bs, actual;
-    struct m0_op *op = NULL;
+    struct m0_op *op;
     struct m0_bufvec buf;
     struct m0_bufvec attr;
     struct m0_indexvec ext;
 
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off =  " << off << ", end = " << end << dendl;
+    // make end pointer exclusive:
+    // it's easier to work with it this way
+    end++;
 
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off=" << off <<
+                                               " end=" << end << dendl;
     // As `off` may not be parity group size aligned, even using optimal
     // buffer block size, simply reading data from offset `off` could come
     // across parity group boundary. And Motr only allows page-size aligned
@@ -903,8 +907,8 @@ namespace rgw::sal {
     // data from motr, but it could be too big for network transfer. 
     //
     // TODO: We leave proper handling of offset in the future.
-    bs = source->get_optimal_bs(end - off + 1);
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): optimal bs = " << bs << dendl;
+    bs = source->get_optimal_bs(end - off);
+    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): bs=" << bs << dendl;
 
     rc = m0_bufvec_empty_alloc(&buf, 1) ? :
          m0_bufvec_alloc(&attr, 1, 1) ? :
@@ -912,13 +916,12 @@ namespace rgw::sal {
     if (rc < 0)
       goto out;
 
-    while (off <= end) {
-      if (end - off + 1 < bs)
-          actual = end - off + 1;
-      else
-	  actual = bs;
-      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off =  " << off << ", actual = " << actual << dendl;
-
+    actual = bs;
+    for (; off < end; off += actual) {
+      if (end - off < bs)
+          actual = end - off;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off=" << off <<
+                                              " actual=" << actual << dendl;
       buf.ov_buf[0] = new char[bs];
       buf.ov_vec.v_count[0] = bs;
       ext.iv_index[0] = off;
@@ -926,8 +929,9 @@ namespace rgw::sal {
       attr.ov_vec.v_count[0] = 0;
 
       // Read from Motr.
+      op = NULL;
       rc = m0_obj_op(source->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
-      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): init read op, rc = " << rc << dendl;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): init read op rc=" << rc << dendl;
       if (rc != 0)
         goto out;
       m0_op_launch(&op, 1);
@@ -941,14 +945,12 @@ namespace rgw::sal {
       // Call `cb` to process returned data.
       bufferlist bl;
       bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual); 
-      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data " << dendl;
+      ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data" << dendl;
       cb->handle_data(bl, off, actual);
 
       // Free memory.
       delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
       buf.ov_buf[0] = NULL;
-
-      off += actual;
     }
 
   out:
@@ -1133,7 +1135,7 @@ namespace rgw::sal {
                 store->conf.mc_layout_id);
 
     struct m0_op *op = NULL;
-    int rc = m0_entity_open( &mobj->ob_entity, &op);
+    int rc = m0_entity_open(&mobj->ob_entity, &op);
     if (rc != 0) {
       ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: " << rc << dendl;
       return rc;
@@ -1143,14 +1145,14 @@ namespace rgw::sal {
          m0_rc(op);
     m0_op_fini(op);
     m0_op_free(op);
-  
+
     if (rc < 0) {
       ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
       delete mobj;
       mobj = NULL;
       return rc;
     }
-	 
+
     layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
     return 0;
   }
@@ -1164,11 +1166,9 @@ namespace rgw::sal {
     mobj = NULL;
   }
 
-  static unsigned roundup_pow2(unsigned x)
+  static unsigned roundup(unsigned x, unsigned by)
   {
-    unsigned n;
-    for (n = 1; n < x; n *= 2) {}
-    return n;
+    return ((x - 1) / by + 1) * by;
   }
 
   unsigned MotrObject::get_optimal_bs(unsigned len)
@@ -1196,13 +1196,13 @@ namespace rgw::sal {
     // P * N / (N + K + S) - number of data units to span the pool-width
     unsigned max_bs = depth * unit_sz * pa->pa_P * pa->pa_N /
                                        (pa->pa_N + pa->pa_K + pa->pa_S);
-    max_bs = ((max_bs - 1) / grp_sz + 1) * grp_sz; // multiple of group size
+    max_bs = roundup(max_bs, grp_sz); // multiple of group size
     if (len >= max_bs)
       return max_bs;
     else if (len <= grp_sz)
       return grp_sz;
     else
-      return roundup_pow2(len);
+      return roundup(len, grp_sz);
   }
 
   void MotrAtomicWriter::cleanup()
@@ -1233,12 +1233,10 @@ namespace rgw::sal {
         ldpp_dout(dpp, 0) << "ERROR: failed to create motr object" << dendl;
         return rc;
       }
-      rc = -ENOMEM;
-      if (m0_bufvec_empty_alloc(&buf, 1) != 0)
-        goto err;
-      if (m0_bufvec_alloc(&attr, 1, 1) != 0)
-        goto err;
-      if (m0_indexvec_alloc(&ext, 1) != 0)
+      rc = m0_bufvec_empty_alloc(&buf, 1) ?:
+           m0_bufvec_alloc(&attr, 1, 1) ?:
+           m0_indexvec_alloc(&ext, 1);
+      if (rc != 0)
         goto err;
     }
 
@@ -1315,7 +1313,7 @@ namespace rgw::sal {
     ent.meta.accounted_size = total_data_size;
     ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
     ent.meta.etag = etag;
-    ldpp_dout(dpp, 0) << "object's etag:  " << etag << dendl;
+    ldpp_dout(dpp, 0) << "object's etag: " << etag << dendl;
     if (user_data)
       ent.meta.user_data = *user_data;
     ent.encode(bl);
