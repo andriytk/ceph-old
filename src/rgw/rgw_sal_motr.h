@@ -44,16 +44,10 @@ namespace rgw::sal {
 class MotrStore;
 
 // Global Motr indices
-#define RGW_MOTR_USERS_IDX_NAME   "motr.rgw.users"
+#define RGW_MOTR_USERS_IDX_NAME       "motr.rgw.users"
 #define RGW_MOTR_BUCKET_INST_IDX_NAME "motr.rgw.bucket.instances"
 #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
 //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
-
-std::string motr_global_indices[] = {
-  RGW_MOTR_USERS_IDX_NAME,
-  RGW_MOTR_BUCKET_INST_IDX_NAME,
-  RGW_MOTR_BUCKET_HD_IDX_NAME
-};
 
 struct MotrUserInfo {
   RGWUserInfo info;

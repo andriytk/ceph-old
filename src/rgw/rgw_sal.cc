@@ -30,9 +30,7 @@
 #endif
 
 #ifdef WITH_RADOSGW_MOTR
-extern "C" {
 #include "rgw_sal_motr.h"
-}
 #endif
 
 
@@ -86,9 +84,7 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
     return store;
   }
 
-  ldpp_dout(dpp, 0) << "Store = " + svc << dendl;
-
-    if (svc.compare("dbstore") == 0) {
+  if (svc.compare("dbstore") == 0) {
 #ifdef WITH_RADOSGW_DBSTORE
     rgw::sal::Store* store = newDBStore(cct);
 
