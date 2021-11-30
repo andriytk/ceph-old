@@ -367,6 +367,7 @@ class MotrObject : public Object {
   public:
 
     struct m0_obj *mobj = NULL;
+    struct m0_uint128 fid;
 
     struct MotrReadOp : public ReadOp {
       private:
