@@ -231,7 +231,6 @@ class MotrBucket : public Bucket {
         DoutPrefixProvider *dpp) override;
     virtual RGWAccessControlPolicy& get_acl(void) override { return acls; }
     virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
-    int put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y);
     virtual int get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y) override;
     int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
     int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
