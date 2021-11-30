@@ -1156,14 +1156,13 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
     return -EINVAL;
   }
 
-  struct m0_uint128 obj_fid;
-  this->obj_name_to_motr_fid(&obj_fid);
+  this->obj_name_to_motr_fid(&fid);
 
   int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
   M0_ASSERT(lid > 0);
 
   mobj = new (struct m0_obj)();
-  m0_obj_init(mobj, &store->container.co_realm, &obj_fid, lid);
+  m0_obj_init(mobj, &store->container.co_realm, &fid, lid);
 
   struct m0_op *op = NULL;
   int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
@@ -1189,13 +1188,11 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
 
 int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
 {
-  struct m0_uint128 obj_fid;
-  this->obj_name_to_motr_fid(&obj_fid);
+  this->obj_name_to_motr_fid(&fid);
 
   mobj = new (struct m0_obj);
   memset(mobj, 0, sizeof *mobj);
-  m0_obj_init(mobj, &store->container.co_realm, &obj_fid,
-              store->conf.mc_layout_id);
+  m0_obj_init(mobj, &store->container.co_realm, &fid, store->conf.mc_layout_id);
 
   struct m0_op *op = NULL;
   int rc = m0_entity_open(&mobj->ob_entity, &op);
@@ -1328,8 +1325,15 @@ int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
 
   if (total_data_size == 0 && left > 0 && !obj.is_opened()) {
     rc = obj.create_mobj(dpp, data.length());
+    if (rc == -EEXIST)
+      rc = obj.open_mobj(dpp);
     if (rc != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: failed to create motr object" << dendl;
+      char fid_str[40];
+      snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&obj.fid));
+      ldpp_dout(dpp, 0) << "ERROR: failed to create/open motr object "
+                        << fid_str << " (" << obj.get_bucket()->get_name()
+                        << "/" << obj.get_key().to_str() << "): rc=" << rc
+                        << dendl;
       return rc;
     }
     rc = m0_bufvec_empty_alloc(&buf, 1) ?:
@@ -2186,7 +2190,7 @@ int MotrStore::do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
     val.assign(bl.c_str(), bl.c_str() + bl.length());
 
   ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key.data()) << dendl;
-  rc = do_idx_op(&idx, opcode, key, val);
+  rc = do_idx_op(&idx, opcode, key, val, true);
   ldout(cctx, 0) << "do_idx_op() = " << rc << dendl;
   if (rc == 0 && opcode == M0_IC_GET)
     // Append the returned value (blob) to the bufferlist.
