@@ -271,32 +271,31 @@ int MotrBucket::remove_bucket_bypass_gc(int concurrent_max, bool
   return 0;
 }
 
-int MotrBucket::put_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
+int MotrBucket::put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::real_time _mtime)
 {
   bufferlist bl;
   struct MotrBucketInfo mbinfo;
 
-  ldpp_dout(dpp, 0) << "put_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
+  ldpp_dout(dpp, 0) << "put_info(): bucket_id=" << info.bucket.bucket_id << dendl;
   mbinfo.info = info;
   mbinfo.bucket_attrs = attrs;
-  mbinfo.mtime = ceph::real_time();
+  mbinfo.mtime = _mtime;
   mbinfo.bucket_version = bucket_version;
   mbinfo.encode(bl);
 
   // Insert bucket instance using bucket's marker (string).
-  int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                    M0_IC_PUT, info.bucket.name, bl);
-  return rc;
+  return store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
+                                  M0_IC_PUT, info.bucket.name, bl);
 }
 
 int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
 {
   // Get bucket instance using bucket's name (string). or bucket id?
   bufferlist bl;
-  ldpp_dout(dpp, 0) << "get_bucket_info(): bucket name  = " << info.bucket.name << dendl;
+  ldpp_dout(dpp, 0) << "get_bucket_info(): name=" << info.bucket.name << dendl;
   int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
                                     M0_IC_GET, info.bucket.name, bl);
-  ldpp_dout(dpp, 0) << "get_bucket_info(): rc  = " << rc << dendl;
+  ldpp_dout(dpp, 0) << "get_bucket_info(): rc=" << rc << dendl;
   if (rc < 0)
       return rc;
 
@@ -306,7 +305,7 @@ int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
   mbinfo.decode(iter); //Decode into MotrBucketInfo.
 
   info = mbinfo.info;
-  ldpp_dout(dpp, 0) << "get_bucket_info(): bucket id  = " << info.bucket.bucket_id << dendl;
+  ldpp_dout(dpp, 0) << "get_bucket_info(): bucket_id=" << info.bucket.bucket_id << dendl;
   rgw_placement_rule placement_rule;
   placement_rule.name = "default";
   placement_rule.storage_class = "STANDARD";
@@ -399,16 +398,6 @@ int MotrBucket::chown(const DoutPrefixProvider *dpp, User* new_user, User* old_u
 
   /* XXX: Update policies of all the bucket->objects with new user */
   return ret;
-}
-
-int MotrBucket::put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::real_time _mtime)
-{
-  int ret = 0;
-
-  //ret = store->getDB()->update_bucket(dpp, "info", info, exclusive, nullptr, nullptr, &_mtime, &info.objv_tracker);
-
-  return ret;
-
 }
 
 int MotrBucket::remove_metadata(const DoutPrefixProvider* dpp, RGWObjVersionTracker* objv, optional_yield y)
@@ -573,7 +562,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     ocount++;
     if (ocount == max) {
         is_truncated = true;
-  break;
+        break;
     }
   }
   results.is_truncated = is_truncated;
@@ -786,11 +775,15 @@ bool MotrObject::is_expired() {
   return false;
 }
 
+// Taken from rgw_rados.cc
 void MotrObject::gen_rand_obj_instance_name()
 {
-   //store->getDB()->gen_rand_obj_instance_name(&key);
-}
+#define OBJ_INSTANCE_LEN 32
+  char buf[OBJ_INSTANCE_LEN + 1];
 
+  gen_rand_alphanumeric_no_underscore(store->ctx(), buf, OBJ_INSTANCE_LEN);
+  key.set_instance(buf);
+}
 
 int MotrObject::omap_get_vals(const DoutPrefixProvider *dpp, const std::string& marker, uint64_t count,
     std::map<std::string, bufferlist> *m,
@@ -890,7 +883,7 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   // in send_response_data() to set attributes, including etag.
   bufferlist etag_bl;
   string& etag = ent.meta.etag;
-  ldpp_dout(dpp, 0) << "object's etag:  " << ent.meta.etag << dendl;
+  ldpp_dout(dpp, 0) << "object's etag: " << ent.meta.etag << dendl;
   etag_bl.append(etag.c_str(), etag.size());
   source->get_attrs().emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
 
@@ -898,13 +891,13 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   source->set_obj_size(ent.meta.size);
 
   // Open the object here.
-  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object. " << dendl;
+  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object." << dendl;
   return source->open_mobj(dpp);
 }
 
 int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
 {
-  ldpp_dout(dpp, 0) << "MotrReadOp::read(): sync read. " << dendl;
+  ldpp_dout(dpp, 0) << "MotrReadOp::read(): sync read." << dendl;
   return 0;
 }
 
@@ -1416,7 +1409,8 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.accounted_size = total_data_size;
   ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
   ent.meta.etag = etag;
-  ldpp_dout(dpp, 0) << "object's etag: " << etag << dendl;
+  ldpp_dout(dpp, 0) << "MotrAtomicWriter::complete(): key=" << obj.get_key().to_str()
+                    << " etag: " << etag << dendl;
   if (user_data)
     ent.meta.user_data = *user_data;
   ent.encode(bl);
@@ -1733,13 +1727,14 @@ int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
       info.placement_rule = placement_rule;
       info.bucket = b;
       info.owner = u->get_info().user_id;
-info.zonegroup = zonegroup_id;
+      info.zonegroup = zonegroup_id;
+      bucket->set_version(ep_objv);
       bucket->get_info() = info;
 
 // Create a new bucket: (1) Add a key/value pair in the
       // bucket instance index. (2) Create a new bucket index.
       MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
-      ret = mbucket->put_bucket_info(dpp, y)? :
+      ret = mbucket->put_info(dpp, false, ceph::real_time())? :
             mbucket->create_bucket_index();
       if (ret < 0)
         ldout(cctx, 0) << "ERROR: failed to create bucket instance index! " << ret << dendl;
@@ -1748,10 +1743,10 @@ info.zonegroup = zonegroup_id;
      ret = mbucket->link_user(dpp, u, y);
      if (ret < 0)
         ldout(cctx, 0) << "ERROR: failed to add bucket entry! " << ret << dendl;
+  } else {
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
   }
-
-  bucket->set_version(ep_objv);
-  bucket->get_info() = info;
 
   bucket_out->swap(bucket);
 
@@ -2081,7 +2076,7 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
 
     vector<uint8_t>& val = val_vec[i];
     val.resize(v.ov_vec.v_count[i]);
-    memcpy(reinterpret_cast<char*>(val.data()), v.ov_buf[i], v.ov_vec.v_count[0]);
+    memcpy(reinterpret_cast<char*>(val.data()), v.ov_buf[i], v.ov_vec.v_count[i]);
   }
 
 out:
@@ -2189,7 +2184,9 @@ int MotrStore::do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
   if (opcode == M0_IC_PUT)
     val.assign(bl.c_str(), bl.c_str() + bl.length());
 
-  ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key.data()) << dendl;
+  ldout(cctx, 0) << "DEBUG: do_idx_op_by_name(): op="
+                 << (opcode == M0_IC_PUT ? "PUT" : "GET")
+                 << " idx=" << idx_name << " key=" << key_str << dendl;
   rc = do_idx_op(&idx, opcode, key, val, true);
   ldout(cctx, 0) << "do_idx_op() = " << rc << dendl;
   if (rc == 0 && opcode == M0_IC_GET)
