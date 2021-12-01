@@ -1409,6 +1409,7 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.accounted_size = total_data_size;
   ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
   ent.meta.etag = etag;
+  ent.meta.owner = owner.to_str();
   ldpp_dout(dpp, 0) << "MotrAtomicWriter::complete(): key=" << obj.get_key().to_str()
                     << " etag: " << etag << dendl;
   if (user_data)
@@ -1728,6 +1729,8 @@ int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
       info.bucket = b;
       info.owner = u->get_info().user_id;
       info.zonegroup = zonegroup_id;
+      if (obj_lock_enabled)
+        info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
       bucket->set_version(ep_objv);
       bucket->get_info() = info;
 
@@ -2092,7 +2095,7 @@ out:
 // the first one of the index in question.
 int MotrStore::next_query_by_name(string idx_name,
                                   vector<string>& key_str_vec,
-          vector<bufferlist>& val_bl_vec)
+                                  vector<bufferlist>& val_bl_vec)
 {
   int nr_kvp = val_bl_vec.size();
   struct m0_idx idx;
