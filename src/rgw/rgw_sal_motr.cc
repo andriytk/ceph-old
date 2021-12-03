@@ -2106,7 +2106,7 @@ int MotrStore::next_query_by_name(string idx_name,
                                   vector<string>& key_str_vec,
                                   vector<bufferlist>& val_bl_vec)
 {
-  int nr_kvp = min_check(val_bl_vec.size(), 100);
+  unsigned nr_kvp = std::min(val_bl_vec.size(), 100UL);
   struct m0_idx idx;
   vector<vector<uint8_t>> key_vec(nr_kvp);
   vector<vector<uint8_t>> val_vec(nr_kvp);
@@ -2124,7 +2124,7 @@ int MotrStore::next_query_by_name(string idx_name,
   // The key_vec will be set will the returned keys from motr index.
   ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name << dendl;
   key_vec[0].assign(prefix.begin(), prefix.end());
-  for (int i = 0; i < val_bl_vec.size(); i += nr_kvp) {
+  for (unsigned long i = 0; i < val_bl_vec.size(); i += nr_kvp) {
     rc = do_idx_next_op(&idx, key_vec, val_vec);
     ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
     if (rc < 0) {
@@ -2132,7 +2132,7 @@ int MotrStore::next_query_by_name(string idx_name,
       goto out;
     }
 
-    for (int j = 0; j < nr_kvp; ++j) {
+    for (unsigned j = 0; j < nr_kvp; ++j) {
       key_str_vec[i + j].assign(key_vec[j].begin(), key_vec[j].end());
       if (prefix.compare(key_str_vec[i + j]) < 0)
 	goto out;
