@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// vim: ts=2 sw=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -59,11 +59,14 @@ int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
   vector<bufferlist> val_vec(max);
   bool is_truncated = false;
 
+  ldpp_dout(dpp, 0) << "DEBUG: list_user_buckets: marker=" << marker
+                    << " end_marker=" << end_marker
+                    << " max=" << max << dendl;
+
   // Retrieve all `max` number of pairs.
   buckets.clear();
   string user_info_iname = "motr.rgw.user.info." + info.user_id.id;
-  key_vec[0] = marker;
-  rc = store->next_query_by_name(user_info_iname, key_vec, val_vec);
+  rc = store->next_query_by_name(user_info_iname, marker, key_vec, val_vec);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
@@ -83,7 +86,7 @@ int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
     ldpp_dout(dpp, 20) << "got creation time: << " << std::put_time(std::localtime(&ctime), "%F %T") << dendl;
 
     if (!end_marker.empty() &&
-        end_marker.compare(ent.bucket.marker) <= 0)
+         end_marker.compare(ent.bucket.marker) <= 0)
       break;
 
     buckets.add(std::make_unique<MotrBucket>(this->store, ent, this));
@@ -529,10 +532,14 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
   vector<bufferlist> val_vec(max);
   bool is_truncated = false;
 
+  ldpp_dout(dpp, 0) << "DEBUG: list_bucket=" << info.bucket.name
+                    << " prefix=" << params.prefix
+                    << " max=" << max << dendl;
+
   // Retrieve all `max` number of pairs.
   string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
-  key_vec[0].clear();
-  rc = store->next_query_by_name(bucket_index_iname, key_vec, val_vec);
+  rc = store->next_query_by_name(bucket_index_iname, params.prefix,
+                                 key_vec, val_vec);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
@@ -549,14 +556,6 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     rgw_bucket_dir_entry ent;
     auto iter = bl.cbegin();
     ent.decode(iter);
-
-    if (params.prefix.size() &&
-        (0 != ent.key.name.compare(0, params.prefix.size(), params.prefix))) {
-      ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
-        ": skippping \"" << ent.key <<
-        "\" because doesn't match prefix" << dendl;
-      continue;
-    }
 
     results.objs.emplace_back(std::move(ent));
     ocount++;
@@ -2099,14 +2098,15 @@ out:
   return rc;
 }
 
-// Retrieve a number of key/value pairs starting with `key`.
-// if `key` is empty, then return the key/value pairs starting with
+// Retrieve a number of key/value pairs under the prefix.
+// If prefix is empty, then return the key/value pairs starting with
 // the first one of the index in question.
 int MotrStore::next_query_by_name(string idx_name,
+                                  string prefix,
                                   vector<string>& key_str_vec,
                                   vector<bufferlist>& val_bl_vec)
 {
-  int nr_kvp = val_bl_vec.size();
+  int nr_kvp = min_check(val_bl_vec.size(), 100);
   struct m0_idx idx;
   vector<vector<uint8_t>> key_vec(nr_kvp);
   vector<vector<uint8_t>> val_vec(nr_kvp);
@@ -2115,25 +2115,30 @@ int MotrStore::next_query_by_name(string idx_name,
   index_name_to_motr_fid(idx_name, &idx_id);
   int rc = open_motr_idx(&idx_id, &idx);
   if (rc != 0) {
-    ldout(cctx, 0) << "ERROR: failed to open index: " << rc << dendl;
+    ldout(cctx, 0) << "ERROR: next_query_by_name(): failed to open index: rc="
+                   << rc << dendl;
     goto out;
   }
 
   // Only the first element for key_vec needs to be set for NEXT query.
   // The key_vec will be set will the returned keys from motr index.
-  ldout(cctx, 0) << "index name = " << idx_name << dendl;
-  key_vec[0].assign(key_str_vec[0].begin(), key_str_vec[0].end());
-  rc = do_idx_next_op(&idx, key_vec, val_vec);
-  ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
-  if (rc < 0) {
-    ldout(cctx, 0) << "ERROR: NEXT query failed. " << rc << dendl;
-    goto out;
-  }
+  ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name << dendl;
+  key_vec[0].assign(prefix.begin(), prefix.end());
+  for (int i = 0; i < val_bl_vec.size(); i += nr_kvp) {
+    rc = do_idx_next_op(&idx, key_vec, val_vec);
+    ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
+    if (rc < 0) {
+      ldout(cctx, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      goto out;
+    }
 
-  for (int i = 0; i < nr_kvp; ++i) {
-    key_str_vec[i].assign(key_vec[i].begin(), key_vec[i].end());
-    bufferlist& vbl = val_bl_vec[i];
-    vbl.append(reinterpret_cast<char*>(val_vec[i].data()), val_vec[i].size());
+    for (int j = 0; j < nr_kvp; ++j) {
+      key_str_vec[i + j].assign(key_vec[j].begin(), key_vec[j].end());
+      if (prefix.compare(key_str_vec[i + j]) < 0)
+	goto out;
+      bufferlist& vbl = val_bl_vec[i + j];
+      vbl.append(reinterpret_cast<char*>(val_vec[j].data()), val_vec[j].size());
+    }
   }
 
 out:
