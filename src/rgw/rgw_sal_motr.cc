@@ -705,6 +705,7 @@ int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
 //    Motr::Object op_target(store->getDB(),
 //        get_bucket()->get_info(), target_obj ? *target_obj : get_obj());
 //    return op_target.set_attrs(dpp, setattrs ? *setattrs : empty, delattrs);
+  ldpp_dout(dpp, 0) << "DEBUG: MotrObject::set_obj_attrs()" << dendl;
   return 0;
 }
 
@@ -714,6 +715,7 @@ int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPr
 //    Motr::Object::Read read_op(&op_target);
 //
 //    return read_attrs(dpp, read_op, y, target_obj);
+  ldpp_dout(dpp, 0) << "DEBUG: MotrObject::get_obj_attrs()" << dendl;
   return 0;
 }
 
@@ -1410,12 +1412,19 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
   ent.meta.etag = etag;
   ent.meta.owner = owner.to_str();
+  bool is_versioned = obj.get_key().have_instance();
+  if (is_versioned)
+    ent.flags = rgw_bucket_dir_entry::FLAG_VER | rgw_bucket_dir_entry::FLAG_CURRENT;
   ldpp_dout(dpp, 0) << "MotrAtomicWriter::complete(): key=" << obj.get_key().to_str()
                     << " etag: " << etag << dendl;
   if (user_data)
     ent.meta.user_data = *user_data;
   ent.encode(bl);
 
+  if (is_versioned) {
+    // get the list of all versioned objects with the same key and
+    // unset their FLAG_CURRENT later, if do_idx_op_by_name() is successful.
+  }
   // Insert an entry into bucket index.
   string bucket_index_iname = "motr.rgw.bucket.index." + obj.get_bucket()->get_name();
   return store->do_idx_op_by_name(bucket_index_iname,
@@ -2112,9 +2121,8 @@ int MotrStore::next_query_by_name(string idx_name,
 
   // Only the first element for key_vec needs to be set for NEXT query.
   // The key_vec will be set will the returned keys from motr index.
-  ldout(cctx, 0) << "index name  = " << idx_name << dendl;
+  ldout(cctx, 0) << "index name = " << idx_name << dendl;
   key_vec[0].assign(key_str_vec[0].begin(), key_str_vec[0].end());
-  ldout(cctx, 0) << "key.data address  = " << std::hex << reinterpret_cast<char *>(key_vec[0].data()) << dendl;
   rc = do_idx_next_op(&idx, key_vec, val_vec);
   ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
   if (rc < 0) {
@@ -2265,12 +2273,20 @@ void *newMotrStore(CephContext *cct)
     // XXX: these params should be taken from config settings and
     // cct somehow?
     store->instance = NULL;
-    store->conf.mc_local_addr     = "172.16.179.134@tcp:12345:34:101";
-    store->conf.mc_ha_addr        = "172.16.179.134@tcp:12345:34:1";
-    store->conf.mc_profile        = "0x7000000000000001:0x0";
-    store->conf.mc_process_fid    = "0x7200000000000001:0x0";
-    store->conf.mc_tm_recv_queue_min_len =    64;
-    store->conf.mc_max_rpc_msg_size      = 65536;
+    const auto& proc_ep  = g_conf().get_val<std::string>("my_motr_endpoint");
+    const auto& ha_ep    = g_conf().get_val<std::string>("motr_ha_endpoint");
+    const auto& proc_fid = g_conf().get_val<std::string>("my_motr_fid");
+    const auto& profile  = g_conf().get_val<std::string>("motr_profile_fid");
+    ldout(cct, 0) << "INFO: my motr endpoint:  " << proc_ep << dendl;
+    ldout(cct, 0) << "INFO: ha agent endpoint: " << ha_ep << dendl;
+    ldout(cct, 0) << "INFO: my motr fid:       " << proc_fid << dendl;
+    ldout(cct, 0) << "INFO: motr profile fid:  " << profile << dendl;
+    store->conf.mc_local_addr  = proc_ep.c_str();
+    store->conf.mc_process_fid = proc_fid.c_str();
+    store->conf.mc_ha_addr     = ha_ep.c_str();
+    store->conf.mc_profile     = profile.c_str();
+    store->conf.mc_tm_recv_queue_min_len =     64;
+    store->conf.mc_max_rpc_msg_size      = 524288;
     store->conf.mc_idx_service_id  = M0_IDX_DIX;
     store->dix_conf.kc_create_meta = false;
     store->conf.mc_idx_service_conf = &store->dix_conf;
