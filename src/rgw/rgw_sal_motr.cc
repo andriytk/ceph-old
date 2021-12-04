@@ -609,6 +609,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
   string bucket_multipart_iname =
       "motr.rgw.bucket." + this->get_name() + ".multiparts";
   key_vec[0].clear();
+  key_vec[0].assign(marker.begin(), marker.end());
   rc = store->next_query_by_name(bucket_multipart_iname, key_vec, val_vec);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
@@ -619,6 +620,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
   // The POC can only support listing all objects or selecting
   // with prefix.
   int ocount = 0;
+  rgw_obj_key last_obj_key;
   *is_truncated = false;
   for (const auto& bl: val_vec) {
     if (bl.length() == 0)
@@ -638,12 +640,14 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
 
     rgw_obj_key key(ent.key);
     uploads.push_back(store->get_multipart_upload(this, key.name));
+    last_obj_key = key;
     ocount++;
     if (ocount == max_uploads) {
       *is_truncated = true;
       break;
     }
   }
+  marker = last_obj_key.name;
 
   // What is common prefix? We don't handle it for now.
 
@@ -1044,8 +1048,11 @@ int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional
     return rc;
   }
 
-  // Remove the motr object.
-  rc = source->delete_mobj(dpp);
+  // Remove the motr objects.
+  if (source->category == RGWObjCategory::MultiMeta)
+    rc = source->delete_part_objs(dpp);
+  else
+    rc = source->delete_mobj(dpp);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
     return rc;
@@ -1418,7 +1425,10 @@ out:
   return rc;
 }
 
-// Scan object_nnn_part_index to get all parts.
+// Scan object_nnn_part_index to get all parts then open their motr objects.
+// TODO: all parts are opened in the POC. But for a large object, for example
+// a 5GB object will have about 300 parts (for default 15MB part). A better
+// way of managing opened object may be needed.
 int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
                               std::map<int, std::unique_ptr<MotrObject>>& part_objs)
 {
@@ -1484,6 +1494,15 @@ int MotrObject::open_part_objs(const DoutPrefixProvider* dpp,
   }
 
   return 0;
+}
+
+int MotrObject::delete_part_objs(const DoutPrefixProvider* dpp)
+{
+  std::unique_ptr<rgw::sal::MultipartUpload> upload;
+  upload = this->store->get_multipart_upload(this->get_bucket(), this->get_name(),
+                                             string(), ceph::real_time());
+  std::unique_ptr<rgw::sal::MotrMultipartUpload> mupload(static_cast<rgw::sal::MotrMultipartUpload *>(upload.release()));
+  return mupload->delete_parts(dpp);
 }
 
 int MotrObject::read_multipart_obj(const DoutPrefixProvider* dpp,
@@ -1698,10 +1717,72 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
                                   M0_IC_PUT, obj.get_key().to_str(), bl);
 }
 
+int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp)
+{
+  int rc;
+  int max_parts = 1000;
+  int marker = 0;
+  bool truncated = false;
+
+  // Scan all parts and delete the corresponding motr objects.
+  do {
+    rc = this->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
+    if (rc == -ENOENT) {
+      rc = -ERR_NO_SUCH_UPLOAD;
+    }
+    if (rc < 0)
+      return rc;
+
+    std::map<uint32_t, std::unique_ptr<MultipartPart>>& parts = this->get_parts();
+    for (auto part_iter = parts.begin(); part_iter != parts.end(); ++part_iter) {
+
+      MultipartPart *mpart = part_iter->second.get();
+      MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
+      uint32_t part_num = mmpart->get_num();
+
+      // Delete the part object. Note that the part object is  not
+      // inserted into bucket index, only the corresponding motr object
+      // needs to be delete. That is why we don't call
+      // MotrObject::delete_object().
+      string part_obj_name = bucket->get_name() + "." +
+ 	                     mp_obj.get_key() +
+	                     ".part." + std::to_string(part_num);
+      std::unique_ptr<rgw::sal::Object> obj;
+      obj = this->bucket->get_object(rgw_obj_key(part_obj_name));
+      std::unique_ptr<rgw::sal::MotrObject> mobj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+      rc = mobj->delete_mobj(dpp);
+      if (rc < 0) {
+        ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
+        return rc;
+      }
+    }
+  } while (truncated);
+
+  // Delete object part index.
+  std::string oid = mp_obj.get_key();
+  string obj_part_iname = "motr.rgw.object." + bucket->get_name() + "." + oid + ".parts";
+  return store->delete_motr_idx_by_name(obj_part_iname);
+}
+
 int MotrMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
                                 RGWObjectCtx *obj_ctx)
 {
-  return 0; // TODO implement
+  int rc;
+
+  // Scan all parts and delete the corresponding motr objects.
+  rc = this->delete_parts(dpp);
+  if (rc < 0)
+    return rc;
+
+  // Remove the upload from bucket multipart index.
+  bufferlist bl;
+  std::unique_ptr<rgw::sal::Object> meta_obj;
+  meta_obj = get_meta_obj();
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
+  return store->do_idx_op_by_name(bucket_multipart_iname,
+                                  M0_IC_DEL, meta_obj->get_key().to_str(), bl);
+  return 0;
 }
 
 std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
@@ -2448,7 +2529,7 @@ int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
     // Create a new bucket: (1) Add a key/value pair in the
     // bucket instance index. (2) Create a new bucket index.
     MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
-    ret = mbucket->put_bucket_info(dpp, y)? :
+    ret = mbucket->put_info(dpp, y, ceph::real_time())? :
           mbucket->create_bucket_index() ? :
           mbucket->create_multipart_indices();
     if (ret < 0)
@@ -2838,6 +2919,35 @@ int MotrStore::next_query_by_name(string idx_name,
     bufferlist& vbl = val_bl_vec[i];
     vbl.append(reinterpret_cast<char*>(val_vec[i].data()), val_vec[i].size());
   }
+
+out:
+  m0_idx_fini(&idx);
+  return rc;
+}
+
+int MotrStore::delete_motr_idx_by_name(string iname)
+{
+  struct m0_idx idx;
+  struct m0_uint128 idx_id;
+  struct m0_op *op = NULL;
+
+  index_name_to_motr_fid(iname, &idx_id);
+  m0_idx_init(&idx, &container.co_realm, &idx_id);
+  m0_entity_open(&idx.in_entity, &op);
+  int rc = m0_entity_delete(&idx.in_entity, &op);
+  if (rc < 0)
+    goto out;
+
+  m0_op_launch(&op, 1);
+  rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+       m0_rc(op);
+  m0_op_fini(op);
+  m0_op_free(op);
+
+  if (rc == -ENOENT) // race deletion??
+    rc = 0;
+  else if (rc < 0)
+    ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
 
 out:
   m0_idx_fini(&idx);

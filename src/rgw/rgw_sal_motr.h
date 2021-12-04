@@ -512,6 +512,7 @@ class MotrObject : public Object {
     int read_multipart_obj(const DoutPrefixProvider* dpp,
                            int64_t off, int64_t end, RGWGetDataCB* cb,
                            std::map<int, std::unique_ptr<MotrObject>>& part_objs);
+    int delete_part_objs(const DoutPrefixProvider* dpp);
 };
 
 // A placeholder locking class for multipart upload.
@@ -702,6 +703,7 @@ public:
 			  const rgw_placement_rule *ptail_placement_rule,
 			  uint64_t part_num,
 			  const std::string& part_num_str) override;
+  int delete_parts(const DoutPrefixProvider *dpp);
 };
 
 class MotrStore : public Store {
@@ -855,6 +857,7 @@ class MotrStore : public Store {
     void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
     int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
     int create_motr_idx_by_name(string iname);
+    int delete_motr_idx_by_name(string iname);
     int do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
                           string key_str, bufferlist &bl);
     int check_n_create_global_indices();
