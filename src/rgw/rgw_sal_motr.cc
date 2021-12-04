@@ -534,11 +534,12 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
 
   ldpp_dout(dpp, 0) << "bucket=" << info.bucket.name
                     << " prefix=" << params.prefix
+                    << " marker=" << params.marker
                     << " max=" << max << dendl;
 
   // Retrieve all `max` number of pairs.
   string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
-  rc = store->next_query_by_name(bucket_index_iname, params.prefix,
+  rc = store->next_query_by_name(bucket_index_iname, params.marker.to_str(),
                                  key_vec, val_vec);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
@@ -561,7 +562,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     ocount++;
     if (ocount == max) {
         is_truncated = true;
-        results.next_marker = key_vec[max - 1] + "\x00";
+        results.next_marker = key_vec[max - 1] + " ";
         break;
     }
   }
