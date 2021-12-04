@@ -532,7 +532,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
   vector<bufferlist> val_vec(max);
   bool is_truncated = false;
 
-  ldpp_dout(dpp, 0) << "DEBUG: list_bucket=" << info.bucket.name
+  ldpp_dout(dpp, 0) << "bucket=" << info.bucket.name
                     << " prefix=" << params.prefix
                     << " max=" << max << dendl;
 
@@ -561,6 +561,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     ocount++;
     if (ocount == max) {
         is_truncated = true;
+        results.next_marker = key_vec[max - 1] + "\x00";
         break;
     }
   }
@@ -2037,32 +2038,26 @@ out:
   return rc;
 }
 
-// A quick impl of retrieving a range of key/value pairs.
-// TODO: it could be merged into do_idx_op().
+// Retrieve a range of key/value pairs starting from key_vec[0].
 int MotrStore::do_idx_next_op(struct m0_idx *idx,
                               vector<vector<uint8_t>>& key_vec,
                               vector<vector<uint8_t>>& val_vec)
 {
   int rc;
+  uint32_t i;
   int nr_kvp = val_vec.size();
   int *rcs = new int[nr_kvp];
   struct m0_bufvec k, v;
   struct m0_op *op = NULL;
 
-  if (m0_bufvec_empty_alloc(&k, nr_kvp) != 0) {
-    ldout(cctx, 0) << "ERROR: failed to allocate key bufvec" << dendl;
-    return -ENOMEM;
-  }
-
-  rc = -ENOMEM;
-  if (m0_bufvec_empty_alloc(&v, nr_kvp) != 0) {
-    ldout(cctx, 0) << "ERROR: failed to allocate value bufvec" << dendl;
-    goto out;
+  rc = m0_bufvec_empty_alloc(&k, nr_kvp)?:
+       m0_bufvec_empty_alloc(&v, nr_kvp);
+  if (rc != 0) {
+    ldout(cctx, 0) << "ERROR: failed to allocate kv bufvecs" << dendl;
+    return rc;
   }
 
   set_m0bufvec(&k, key_vec[0]);
-  ldout(cctx, 0) << "bv->ov_buf[0] = " << k.ov_buf[0] << dendl;
-  ldout(cctx, 0) << "bv->ov_vec.v_count[0]" << k.ov_buf[0] << dendl;
 
   rc = m0_idx_op(idx, M0_IC_NEXT, &k, &v, rcs, 0, &op);
   if (rc != 0) {
@@ -2081,21 +2076,24 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
     goto out;
   }
 
-  for (uint32_t i = 0; i < v.ov_vec.v_nr; ++i) {
+  for (i = 0; i < v.ov_vec.v_nr; ++i) {
     if (rcs[i] < 0)
       break;
 
+    vector<uint8_t>& key = key_vec[i];
     vector<uint8_t>& val = val_vec[i];
+    key.resize(k.ov_vec.v_count[i]);
     val.resize(v.ov_vec.v_count[i]);
+    memcpy(reinterpret_cast<char*>(key.data()), k.ov_buf[i], k.ov_vec.v_count[i]);
     memcpy(reinterpret_cast<char*>(val.data()), v.ov_buf[i], v.ov_vec.v_count[i]);
   }
 
 out:
-  m0_bufvec_free2(&k);
+  m0_bufvec_free(&k);
   m0_bufvec_free(&v); // cleanup buffer after GET
 
   delete []rcs;
-  return rc;
+  return rc ?: i;
 }
 
 // Retrieve a number of key/value pairs under the prefix.
@@ -2122,7 +2120,8 @@ int MotrStore::next_query_by_name(string idx_name,
 
   // Only the first element for key_vec needs to be set for NEXT query.
   // The key_vec will be set will the returned keys from motr index.
-  ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name << dendl;
+  ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name
+                 << " prefix=" << prefix << dendl;
   key_vec[0].assign(prefix.begin(), prefix.end());
   for (unsigned long i = 0; i < val_bl_vec.size(); i += nr_kvp) {
     rc = do_idx_next_op(&idx, key_vec, val_vec);
@@ -2132,13 +2131,18 @@ int MotrStore::next_query_by_name(string idx_name,
       goto out;
     }
 
-    for (unsigned j = 0; j < nr_kvp; ++j) {
+    for (int j = 0; j < rc; ++j) {
       key_str_vec[i + j].assign(key_vec[j].begin(), key_vec[j].end());
-      if (prefix.compare(key_str_vec[i + j]) < 0)
-	goto out;
+      if (key_str_vec[i + j].compare(0, prefix.length(), prefix) != 0)
+        goto out;
       bufferlist& vbl = val_bl_vec[i + j];
       vbl.append(reinterpret_cast<char*>(val_vec[j].data()), val_vec[j].size());
     }
+    if (rc < (int)nr_kvp)
+      break;
+    auto& last_key = key_str_vec[i + nr_kvp - 1];
+    ldout(cctx, 0) << "do_idx_next_op(): last_key=" << last_key << dendl;
+    key_vec[0].assign(last_key.begin(), last_key.end());
   }
 
 out:
