@@ -762,8 +762,9 @@ class MotrStore : public Store {
     int do_idx_next_op(struct m0_idx *idx,
                        vector<vector<uint8_t>>& key_vec,
                        vector<vector<uint8_t>>& val_vec);
-    int next_query_by_name(string idx_name, string prefix,
-                           vector<string>& key_str_vec, std::vector<bufferlist>& val_bl_vec);
+    int next_query_by_name(string idx_name, vector<string>& key_str_vec,
+                                            vector<bufferlist>& val_bl_vec,
+                                            string prefix="", string delim="");
 
     void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
     int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
