@@ -67,7 +67,7 @@ int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
   buckets.clear();
   string user_info_iname = "motr.rgw.user.info." + info.user_id.id;
   keys[0] = marker;
-  rc = store->next_query_by_name(user_info_iname, "", keys, vals);
+  rc = store->next_query_by_name(user_info_iname, keys, vals);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
@@ -531,7 +531,6 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
   int rc;
   vector<string> keys(max);
   vector<bufferlist> vals(max);
-  bool is_truncated = false;
 
   ldpp_dout(dpp, 0) << "bucket=" << info.bucket.name
                     << " prefix=" << params.prefix
@@ -542,33 +541,32 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
   string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
   keys[0] = params.marker.empty() ? params.prefix :
                                     params.marker.to_str();
-  rc = store->next_query_by_name(bucket_index_iname, params.prefix, keys, vals);
+  rc = store->next_query_by_name(bucket_index_iname, keys, vals, params.prefix,
+                                                                 params.delim);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
   }
 
   // Process the returned pairs to add into ListResults.
-  // The POC can only support listing all objects or selecting
-  // with prefix.
-  int ocount = 0;
-  for (const auto& bl: vals) {
-    if (bl.length() == 0)
-      break;
-
-    rgw_bucket_dir_entry ent;
-    auto iter = bl.cbegin();
-    ent.decode(iter);
-
-    results.objs.emplace_back(std::move(ent));
-    ocount++;
-    if (ocount == max) {
-        is_truncated = true;
-        results.next_marker = keys[max - 1] + " ";
-        break;
+  int i = 0;
+  for (; i < rc; ++i) {
+    if (vals[i].length() == 0) {
+      results.common_prefixes[keys[i]] = true;
+    } else {
+      rgw_bucket_dir_entry ent;
+      auto iter = vals[i].cbegin();
+      ent.decode(iter);
+      results.objs.emplace_back(std::move(ent));
     }
   }
-  results.is_truncated = is_truncated;
+
+  if (i == max) {
+    results.is_truncated = true;
+    results.next_marker = keys[max - 1] + " ";
+  } else {
+    results.is_truncated = false;
+  }
 
   return 0;
 }
@@ -2102,15 +2100,16 @@ out:
 // Retrieve a number of key/value pairs under the prefix starting
 // from the marker at key_out[0].
 int MotrStore::next_query_by_name(string idx_name,
-                                  string prefix,
                                   vector<string>& key_out,
-                                  vector<bufferlist>& val_out)
+                                  vector<bufferlist>& val_out,
+                                  string prefix, string delim)
 {
   unsigned nr_kvp = std::min(val_out.size(), 100UL);
   struct m0_idx idx;
   vector<vector<uint8_t>> keys(nr_kvp);
   vector<vector<uint8_t>> vals(nr_kvp);
   struct m0_uint128 idx_id;
+  int i = 0, j, k = 0;
 
   index_name_to_motr_fid(idx_name, &idx_id);
   int rc = open_motr_idx(&idx_id, &idx);
@@ -2125,7 +2124,7 @@ int MotrStore::next_query_by_name(string idx_name,
   ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name
                  << " prefix=" << prefix << dendl;
   keys[0].assign(key_out[0].begin(), key_out[0].end());
-  for (unsigned long i = 0; i < val_out.size(); i += nr_kvp) {
+  for (i = 0; i < (int)val_out.size(); i += k, k = 0) {
     rc = do_idx_next_op(&idx, keys, vals);
     ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
     if (rc < 0) {
@@ -2133,23 +2132,42 @@ int MotrStore::next_query_by_name(string idx_name,
       goto out;
     }
 
-    for (int j = 0; j < rc; ++j) {
-      key_out[i + j].assign(keys[j].begin(), keys[j].end());
-      if (key_out[i + j].compare(0, prefix.length(), prefix) != 0)
+    string dir;
+    for (j = 0, k = 0; j < rc; ++j) {
+      string key(keys[j].begin(), keys[j].end());
+      size_t pos = key.find(delim, prefix.length());
+      if (pos && pos != std::string::npos) { // DIR entry
+        dir.assign(key, 0, pos + 1);
+        if (dir.compare(0, prefix.length(), prefix) != 0)
+          goto out;
+        if (i + k == 0 || dir != key_out[i + k - 1]) // a new one
+          key_out[i + k++] = dir;
+        continue;
+      }
+      dir = "";
+      if (key.compare(0, prefix.length(), prefix) != 0)
         goto out;
-      bufferlist& vbl = val_out[i + j];
+      key_out[i + k] = key;
+      bufferlist& vbl = val_out[i + k];
       vbl.append(reinterpret_cast<char*>(vals[j].data()), vals[j].size());
+      ++k;
     }
-    if (rc < (int)nr_kvp)
+
+    if (rc < (int)nr_kvp) // there are no more keys to fetch
       break;
-    auto& last_key = key_out[i + nr_kvp - 1];
-    ldout(cctx, 0) << "do_idx_next_op(): last_key=" << last_key << dendl;
-    keys[0].assign(last_key.begin(), last_key.end());
+
+    string next_key;
+    if (dir != "")
+      next_key = dir + "\xff"; // skip all dir content in 1 step
+    else
+      next_key = key_out[i + k - 1] + " ";
+    ldout(cctx, 0) << "do_idx_next_op(): next_key=" << next_key << dendl;
+    keys[0].assign(next_key.begin(), next_key.end());
   }
 
 out:
   m0_idx_fini(&idx);
-  return rc;
+  return rc < 0 ? rc : i + k;
 }
 
 int MotrStore::open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx)
