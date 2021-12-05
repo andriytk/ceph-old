@@ -29,6 +29,7 @@ extern "C" {
 #include "common/Clock.h"
 #include "common/errno.h"
 
+#include "rgw_compression.h"
 #include "rgw_sal.h"
 #include "rgw_sal_motr.h"
 #include "rgw_bucket.h"
@@ -369,6 +370,28 @@ int MotrBucket::create_bucket_index()
   return store->create_motr_idx_by_name(bucket_index_iname);
 }
 
+int MotrBucket::create_multipart_indices()
+{
+  int rc;
+
+  // Bucket multipart index stores in-progress multipart uploads.
+  // Key is the object name + upload_id, value is a rgw_bucket_dir_entry.
+  // An entry is inserted when a multipart upload is initialised (
+  // MotrMultipartUpload::init()) and will be removed when the upload
+  // is completed (MotrMultipartUpload::complete()).
+  // MotrBucket::list_multiparts() will scan this index to return all
+  // in-progress multipart uploads in the bucket.
+  string bucket_multipart_iname = "motr.rgw.bucket." + info.bucket.name + ".multiparts";
+  rc = store->create_motr_idx_by_name(bucket_multipart_iname);
+  if (rc < 0) {
+    ldout(store->cctx, 0) << "Failed to create bucket multipart index  " << bucket_multipart_iname << dendl;
+    return rc;
+  }
+
+  return 0;
+}
+
+
 int MotrBucket::get_bucket_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
 {
   return 0;
@@ -580,7 +603,57 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
       map<string, bool> *common_prefixes,
       bool *is_truncated)
 {
+  int rc;
+  vector<string> key_vec(max_uploads);
+  vector<bufferlist> val_vec(max_uploads);
+
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + this->get_name() + ".multiparts";
+  key_vec[0].clear();
+  key_vec[0].assign(marker.begin(), marker.end());
+  rc = store->next_query_by_name(bucket_multipart_iname, key_vec, val_vec);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+    return rc;
+  }
+
+  // Process the returned pairs to add into ListResults.
+  // The POC can only support listing all objects or selecting
+  // with prefix.
+  int ocount = 0;
+  rgw_obj_key last_obj_key;
+  *is_truncated = false;
+  for (const auto& bl: val_vec) {
+    if (bl.length() == 0)
+      break;
+
+    rgw_bucket_dir_entry ent;
+    auto iter = bl.cbegin();
+    ent.decode(iter);
+
+    if (prefix.size() &&
+        (0 != ent.key.name.compare(0, prefix.size(), prefix))) {
+      ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ": skippping \"" << ent.key <<
+        "\" because doesn't match prefix" << dendl;
+      continue;
+    }
+
+    rgw_obj_key key(ent.key);
+    uploads.push_back(store->get_multipart_upload(this, key.name));
+    last_obj_key = key;
+    ocount++;
+    if (ocount == max_uploads) {
+      *is_truncated = true;
+      break;
+    }
+  }
+  marker = last_obj_key.name;
+
+  // What is common prefix? We don't handle it for now.
+
   return 0;
+
 }
 
 int MotrBucket::abort_multiparts(const DoutPrefixProvider *dpp,
@@ -671,6 +744,9 @@ int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
   bufferlist& blr = bl;
   auto iter = blr.cbegin();
   ent.decode(iter);
+
+  // Set object's type.
+  this->category = ent.meta.category;
 
   // Set object state.
   RGWObjState *s = *state;
@@ -828,7 +904,7 @@ int MotrObject::omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::st
 
 MPSerializer* MotrObject::get_serializer(const DoutPrefixProvider *dpp, const std::string& lock_name)
 {
-  return nullptr;
+  return new MPMotrSerializer(dpp, store, this, lock_name);
 }
 
 int MotrObject::transition(RGWObjectCtx& rctx,
@@ -866,12 +942,14 @@ MotrObject::MotrReadOp::MotrReadOp(MotrObject *_source, RGWObjectCtx *_rctx) :
 int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
 {
   int rc;
+  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): enter, bucket =  " << source->get_bucket()->get_name() << dendl;
 
   // Get object's metadata (those stored in rgw_bucket_dir_entry).
   bufferlist bl;
   string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
   rc = source->store->do_idx_op_by_name(bucket_index_iname,
                                 M0_IC_GET, source->get_key().to_str(), bl);
+  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): query bucket index "<< bucket_index_iname << dendl;
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index." << dendl;
     return rc;
@@ -892,10 +970,17 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
 
   source->set_key(ent.key);
   source->set_obj_size(ent.meta.size);
+  source->category = ent.meta.category;
 
   // Open the object here.
-  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object." << dendl;
-  return source->open_mobj(dpp);
+  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open object. " << dendl;
+  if (source->category == RGWObjCategory::MultiMeta) {
+    ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open part objects. " << dendl;
+    rc = source->get_part_objs(dpp, this->part_objs)? :
+         source->open_part_objs(dpp, this->part_objs);
+    return rc;
+  } else
+    return source->open_mobj(dpp);
 }
 
 int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
@@ -914,83 +999,14 @@ int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optio
 // a block of data each time and call 'cb' for post-processing.
 int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off, int64_t end, RGWGetDataCB* cb, optional_yield y)
 {
-
   int rc;
-  unsigned bs, actual;
-  struct m0_op *op;
-  struct m0_bufvec buf;
-  struct m0_bufvec attr;
-  struct m0_indexvec ext;
 
-  // make end pointer exclusive:
-  // it's easier to work with it this way
-  end++;
+  if (source->category == RGWObjCategory::MultiMeta)
+    rc = source->read_multipart_obj(dpp, off, end, cb, part_objs);
+  else
+    rc = source->read_mobj(dpp, off, end, cb);
 
-  ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off=" << off <<
-                                             " end=" << end << dendl;
-  // As `off` may not be parity group size aligned, even using optimal
-  // buffer block size, simply reading data from offset `off` could come
-  // across parity group boundary. And Motr only allows page-size aligned
-  // offset.
-  //
-  // The optimal size of each IO should also take into account the data
-  // transfer size to s3 client. For example, 16MB may be nice to read
-  // data from motr, but it could be too big for network transfer.
-  //
-  // TODO: We leave proper handling of offset in the future.
-  bs = source->get_optimal_bs(end - off);
-  ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): bs=" << bs << dendl;
-
-  rc = m0_bufvec_empty_alloc(&buf, 1) ? :
-       m0_bufvec_alloc(&attr, 1, 1) ? :
-       m0_indexvec_alloc(&ext, 1);
-  if (rc < 0)
-    goto out;
-
-  actual = bs;
-  for (; off < end; off += actual) {
-    if (end - off < bs)
-        actual = end - off;
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): off=" << off <<
-                                            " actual=" << actual << dendl;
-    buf.ov_buf[0] = new char[bs];
-    buf.ov_vec.v_count[0] = bs;
-    ext.iv_index[0] = off;
-    ext.iv_vec.v_count[0] = bs;
-    attr.ov_vec.v_count[0] = 0;
-
-    // Read from Motr.
-    op = NULL;
-    rc = m0_obj_op(source->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): init read op rc=" << rc << dendl;
-    if (rc != 0)
-      goto out;
-    m0_op_launch(&op, 1);
-    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
-         m0_rc(op);
-    m0_op_fini(op);
-    m0_op_free(op);
-    if (rc != 0)
-      goto out;
-
-    // Call `cb` to process returned data.
-    bufferlist bl;
-    bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual);
-    ldpp_dout(dpp, 0) << "MotrReadOp::iterate(): call cb to process data" << dendl;
-    cb->handle_data(bl, off, actual);
-
-    // Free memory.
-    delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
-    buf.ov_buf[0] = NULL;
-  }
-
-out:
-  m0_indexvec_free(&ext);
-  m0_bufvec_free(&attr);
-  m0_bufvec_free2(&buf);
-  source->close_mobj();
   return rc;
-
 }
 
 int MotrObject::MotrReadOp::get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y)
@@ -1021,7 +1037,7 @@ MotrObject::MotrDeleteOp::MotrDeleteOp(MotrObject *_source, RGWObjectCtx *_rctx)
 // (2) How to delete objects created by multipart upload?
 int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional_yield y)
 {
-  ldpp_dout(dpp, 0) << "delete  " << source->get_key().to_str() << "from " << source->get_bucket()->get_name() << dendl;
+  ldpp_dout(dpp, 0) << "delete  " << source->get_key().to_str() << " from " << source->get_bucket()->get_name() << dendl;
 
   // Delete the object's entry from the bucket index.
   bufferlist bl;
@@ -1033,8 +1049,11 @@ int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional
     return rc;
   }
 
-  // Remove the motr object.
-  rc = source->delete_mobj(dpp);
+  // Remove the motr objects.
+  if (source->category == RGWObjCategory::MultiMeta)
+    rc = source->delete_part_objs(dpp);
+  else
+    rc = source->delete_mobj(dpp);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
     return rc;
@@ -1154,6 +1173,7 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
 
   this->obj_name_to_motr_fid(&fid);
 
+  ldpp_dout(dpp, 0) << "create_mobj(): sz = " << sz << dendl;
   int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
   M0_ASSERT(lid > 0);
 
@@ -1161,11 +1181,13 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   m0_obj_init(mobj, &store->container.co_realm, &fid, lid);
 
   struct m0_op *op = NULL;
+  ldpp_dout(dpp, 0) << "create_mobj(): m0_entity_create() " << dendl;
   int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
   if (rc != 0) {
     ldpp_dout(dpp, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
     return rc;
   }
+  ldpp_dout(dpp, 0) << "create_mobj(): m0_op_launch() " << dendl;
   m0_op_launch(&op, 1);
   rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
        m0_rc(op);
@@ -1174,11 +1196,13 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
 
   if (rc != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create motr object: " << rc << dendl;
+    delete mobj;
+    mobj = NULL;
     return rc;
   }
 
   layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
-
+  ldpp_dout(dpp, 0) << "create_mobj(): rc =  " << rc << dendl;
   return rc;
 }
 
@@ -1256,6 +1280,268 @@ void MotrObject::close_mobj()
   m0_obj_fini(mobj);
   delete mobj;
   mobj = NULL;
+}
+
+int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uint64_t offset)
+{
+  int rc;
+  unsigned bs, left;
+  struct m0_op *op;
+  char *start, *p;
+  bufferlist cdata, cdata_tail;
+  struct m0_bufvec buf;
+  struct m0_bufvec attr;
+  struct m0_indexvec ext;
+
+  left = data.length();
+  if (left == 0)
+    return 0;
+
+  rc = m0_bufvec_empty_alloc(&buf, 1) ?:
+       m0_bufvec_alloc(&attr, 1, 1) ?:
+       m0_indexvec_alloc(&ext, 1);
+  if (rc != 0)
+    goto out;
+
+  bs = this->get_optimal_bs(left);
+  ldpp_dout(dpp, 0) << "DEBUG: left=" << left << " bs=" << bs << dendl;
+
+  if (!data.is_contiguous())
+    data.splice(0, left, &cdata);
+  else
+    cdata = data;
+
+  start = cdata.c_str();
+
+  for (p = start; left > 0; left -= bs, p += bs, offset += bs) {
+    if (left < bs)
+      bs = this->get_optimal_bs(left);
+    if (left < bs) {
+      cdata.append_zero(bs - left);
+      left = bs;
+      cdata.splice(p - start, bs, &cdata_tail);
+      p = cdata_tail.c_str();
+    }
+    buf.ov_buf[0] = p;
+    buf.ov_vec.v_count[0] = bs;
+    ext.iv_index[0] = offset;
+    ext.iv_vec.v_count[0] = bs;
+    attr.ov_vec.v_count[0] = 0;
+
+    op = NULL;
+    rc = m0_obj_op(this->mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
+    if (rc != 0)
+      goto out;
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+    if (rc != 0)
+      goto out;
+  }
+
+out:
+  m0_indexvec_free(&ext);
+  m0_bufvec_free(&attr);
+  m0_bufvec_free2(&buf);
+  return rc;
+}
+
+int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t end, RGWGetDataCB* cb)
+{
+  int rc;
+  unsigned bs, actual;
+  struct m0_op *op;
+  struct m0_bufvec buf;
+  struct m0_bufvec attr;
+  struct m0_indexvec ext;
+
+  // make end pointer exclusive:
+  // it's easier to work with it this way
+  end++;
+  ldpp_dout(dpp, 0) << "MotrObject::read_mobj(): off=" << off <<
+                       " end=" << end << dendl;
+  // As `off` may not be parity group size aligned, even using optimal
+  // buffer block size, simply reading data from offset `off` could come
+  // across parity group boundary. And Motr only allows page-size aligned
+  // offset.
+  //
+  // The optimal size of each IO should also take into account the data
+  // transfer size to s3 client. For example, 16MB may be nice to read
+  // data from motr, but it could be too big for network transfer.
+  //
+  // TODO: We leave proper handling of offset in the future.
+  bs = this->get_optimal_bs(end - off);
+  ldpp_dout(dpp, 0) << "MotrObject::read_mobj(): bs=" << bs << dendl;
+
+  rc = m0_bufvec_empty_alloc(&buf, 1) ? :
+       m0_bufvec_alloc(&attr, 1, 1) ? :
+       m0_indexvec_alloc(&ext, 1);
+  if (rc < 0)
+    goto out;
+
+  actual = bs;
+  for (; off < end; off += actual) {
+    if (end - off < bs)
+        actual = end - off;
+    ldpp_dout(dpp, 0) << "MotrObject::read_mobj(): off=" << off <<
+                                            " actual=" << actual << dendl;
+    buf.ov_buf[0] = new char[bs];
+    buf.ov_vec.v_count[0] = bs;
+    ext.iv_index[0] = off;
+    ext.iv_vec.v_count[0] = bs;
+    attr.ov_vec.v_count[0] = 0;
+
+    // Read from Motr.
+    op = NULL;
+    rc = m0_obj_op(this->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
+    ldpp_dout(dpp, 0) << "MotrObject::read_mobj(): init read op rc=" << rc << dendl;
+    if (rc != 0)
+      goto out;
+    m0_op_launch(&op, 1);
+    rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+         m0_rc(op);
+    m0_op_fini(op);
+    m0_op_free(op);
+    if (rc != 0)
+      goto out;
+
+    // Call `cb` to process returned data.
+    bufferlist bl;
+    bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual);
+    ldpp_dout(dpp, 0) << "MotrObject::read_mobj(): call cb to process data" << dendl;
+    cb->handle_data(bl, off, actual);
+
+    // Free memory.
+    delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
+    buf.ov_buf[0] = NULL;
+  }
+
+out:
+  m0_indexvec_free(&ext);
+  m0_bufvec_free(&attr);
+  m0_bufvec_free2(&buf);
+  this->close_mobj();
+  return rc;
+}
+
+// Scan object_nnn_part_index to get all parts then open their motr objects.
+// TODO: all parts are opened in the POC. But for a large object, for example
+// a 5GB object will have about 300 parts (for default 15MB part). A better
+// way of managing opened object may be needed.
+int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
+                              std::map<int, std::unique_ptr<MotrObject>>& part_objs)
+{
+  int rc;
+  int total_parts = 0;
+  int max_parts = 1000;
+  int marker = 0;
+  uint64_t off = 0;
+  bool truncated = false;
+  std::unique_ptr<rgw::sal::MultipartUpload> upload;
+
+  upload = this->store->get_multipart_upload(this->get_bucket(), this->get_name(),
+                                             string(), ceph::real_time());
+
+  do {
+    rc = upload->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
+    if (rc == -ENOENT) {
+      rc = -ERR_NO_SUCH_UPLOAD;
+    }
+    if (rc < 0)
+      return rc;
+
+    total_parts += upload->get_parts().size();
+
+    std::map<uint32_t, std::unique_ptr<MultipartPart>>& parts = upload->get_parts();
+    for (auto part_iter = parts.begin(); part_iter != parts.end(); ++part_iter) {
+
+      MultipartPart *mpart = part_iter->second.get();
+      MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
+      uint32_t part_num = mmpart->get_num();
+      uint64_t part_size = mmpart->get_size();
+
+      string part_obj_name = this->get_bucket()->get_name() + "." +
+ 	                     this->get_key().to_str() +
+	                     ".part." + std::to_string(part_num);
+      std::unique_ptr<rgw::sal::Object> obj;
+      obj = this->bucket->get_object(rgw_obj_key(part_obj_name));
+      std::unique_ptr<rgw::sal::MotrObject> mobj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+
+      ldpp_dout(dpp, 0) << "get_part_objs: off = " << off << ", size = " << part_size << dendl;
+      mobj->part_off = off;
+      mobj->part_size = part_size;
+      mobj->part_num = part_num;
+      part_objs.emplace(part_num, std::move(mobj));
+
+      off += part_size;
+    }
+  } while (truncated);
+
+  return 0;
+}
+
+int MotrObject::open_part_objs(const DoutPrefixProvider* dpp,
+                               std::map<int, std::unique_ptr<MotrObject>>& part_objs)
+{
+  //for (auto& iter: part_objs) {
+  for (auto iter = part_objs.begin(); iter != part_objs.end(); ++iter) {
+    MotrObject* obj = static_cast<MotrObject *>(iter->second.get());
+    ldpp_dout(dpp, 0) << "open_part_objs: name = " << obj->get_name() << dendl;
+    int rc = obj->open_mobj(dpp);
+    if (rc < 0)
+      return rc;
+  }
+
+  return 0;
+}
+
+int MotrObject::delete_part_objs(const DoutPrefixProvider* dpp)
+{
+  std::unique_ptr<rgw::sal::MultipartUpload> upload;
+  upload = this->store->get_multipart_upload(this->get_bucket(), this->get_name(),
+                                             string(), ceph::real_time());
+  std::unique_ptr<rgw::sal::MotrMultipartUpload> mupload(static_cast<rgw::sal::MotrMultipartUpload *>(upload.release()));
+  return mupload->delete_parts(dpp);
+}
+
+int MotrObject::read_multipart_obj(const DoutPrefixProvider* dpp,
+                                   int64_t off, int64_t end, RGWGetDataCB* cb,
+				   std::map<int, std::unique_ptr<MotrObject>>& part_objs)
+{
+  int64_t cursor = off;
+
+  ldpp_dout(dpp, 0) << "read_multipart_obj: off = " << off << dendl;
+  ldpp_dout(dpp, 0) << "read_multipart_obj: end = " << end << dendl;
+
+  // Find the parts which are in the (off, end) range and
+  // read data from it. Note: `end` argument is inclusive.
+  for (auto iter = part_objs.begin(); iter != part_objs.end(); ++iter) {
+    MotrObject* obj = static_cast<MotrObject *>(iter->second.get());
+    int64_t part_off = obj->part_off;
+    int64_t part_size = obj->part_size;
+    int64_t part_end = obj->part_off + obj->part_size - 1;
+    ldpp_dout(dpp, 0) << "read_multipart_obj: part_off = " << part_off << dendl;
+    ldpp_dout(dpp, 0) << "read_multipart_obj: part_end = " << part_end << dendl;
+    if (part_end < off)
+      continue;
+
+    int64_t local_off = cursor - obj->part_off;
+    int64_t local_end = part_end < end? part_size - 1 : end - part_off;
+    ldpp_dout(dpp, 0) << "real_multipart_obj: name = " << obj->get_name() << dendl;
+    ldpp_dout(dpp, 0) << "read_multipart_obj: local_off = " << local_off << dendl;
+    ldpp_dout(dpp, 0) << "read_multipart_obj: local_end = " << local_end << dendl;
+    int rc = obj->read_mobj(dpp, local_off, local_end, cb);
+    if (rc < 0)
+        return rc;
+
+    cursor = part_end + 1;
+    if (cursor > end)
+      break;
+  }
+
+  return 0;
 }
 
 static unsigned roundup(unsigned x, unsigned by)
@@ -1432,10 +1718,72 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
                                   M0_IC_PUT, obj.get_key().to_str(), bl);
 }
 
+int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp)
+{
+  int rc;
+  int max_parts = 1000;
+  int marker = 0;
+  bool truncated = false;
+
+  // Scan all parts and delete the corresponding motr objects.
+  do {
+    rc = this->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
+    if (rc == -ENOENT) {
+      rc = -ERR_NO_SUCH_UPLOAD;
+    }
+    if (rc < 0)
+      return rc;
+
+    std::map<uint32_t, std::unique_ptr<MultipartPart>>& parts = this->get_parts();
+    for (auto part_iter = parts.begin(); part_iter != parts.end(); ++part_iter) {
+
+      MultipartPart *mpart = part_iter->second.get();
+      MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
+      uint32_t part_num = mmpart->get_num();
+
+      // Delete the part object. Note that the part object is  not
+      // inserted into bucket index, only the corresponding motr object
+      // needs to be delete. That is why we don't call
+      // MotrObject::delete_object().
+      string part_obj_name = bucket->get_name() + "." +
+ 	                     mp_obj.get_key() +
+	                     ".part." + std::to_string(part_num);
+      std::unique_ptr<rgw::sal::Object> obj;
+      obj = this->bucket->get_object(rgw_obj_key(part_obj_name));
+      std::unique_ptr<rgw::sal::MotrObject> mobj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+      rc = mobj->delete_mobj(dpp);
+      if (rc < 0) {
+        ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
+        return rc;
+      }
+    }
+  } while (truncated);
+
+  // Delete object part index.
+  std::string oid = mp_obj.get_key();
+  string obj_part_iname = "motr.rgw.object." + bucket->get_name() + "." + oid + ".parts";
+  return store->delete_motr_idx_by_name(obj_part_iname);
+}
+
 int MotrMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
                                 RGWObjectCtx *obj_ctx)
 {
-  return 0; // TODO implement
+  int rc;
+
+  // Scan all parts and delete the corresponding motr objects.
+  rc = this->delete_parts(dpp);
+  if (rc < 0)
+    return rc;
+
+  // Remove the upload from bucket multipart index.
+  bufferlist bl;
+  std::unique_ptr<rgw::sal::Object> meta_obj;
+  meta_obj = get_meta_obj();
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
+  return store->do_idx_op_by_name(bucket_multipart_iname,
+                                  M0_IC_DEL, meta_obj->get_key().to_str(), bl);
+  return 0;
 }
 
 std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
@@ -1443,9 +1791,86 @@ std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
   return bucket->get_object(rgw_obj_key(get_meta(), string(), mp_ns));
 }
 
-int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y, RGWObjectCtx* obj_ctx, ACLOwner& owner, rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs)
+struct motr_multipart_upload_info
 {
-  return 0;
+  rgw_placement_rule dest_placement;
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(dest_placement, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(dest_placement, bl);
+    DECODE_FINISH(bl);
+  }
+};
+WRITE_CLASS_ENCODER(motr_multipart_upload_info)
+
+int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y,
+                              RGWObjectCtx* obj_ctx, ACLOwner& owner,
+			      rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs)
+{
+  int rc;
+  std::string oid = mp_obj.get_key();
+
+  do {
+    char buf[33];
+    string tmp_obj_name;
+    gen_rand_alphanumeric(store->ctx(), buf, sizeof(buf) - 1);
+    std::string upload_id = MULTIPART_UPLOAD_ID_PREFIX; /* v2 upload id */
+    upload_id.append(buf);
+
+    mp_obj.init(oid, upload_id);
+    tmp_obj_name = mp_obj.get_meta();
+
+    std::unique_ptr<rgw::sal::Object> obj;
+    obj = bucket->get_object(rgw_obj_key(tmp_obj_name, string(), mp_ns));
+    // the meta object will be indexed with 0 size, we c
+    obj->set_in_extra_data(true);
+    obj->set_hash_source(oid);
+
+    motr_multipart_upload_info upload_info;
+    upload_info.dest_placement = dest_placement;
+    bufferlist mpbl;
+    encode(upload_info, mpbl);
+
+    // Create an initial entry in the bucket. The entry will be
+    // updated when multipart upload is completed, for example,
+    // size, etag etc.
+    bufferlist bl;
+    rgw_bucket_dir_entry ent;
+    obj->get_key().get_index_key(&ent.key);
+    ent.meta.owner = owner.get_id().to_str();
+    ent.meta.category = RGWObjCategory::MultiMeta;
+    ent.meta.mtime = ceph::real_clock::now();
+    ent.meta.user_data.assign(mpbl.c_str(), mpbl.c_str() + mpbl.length());
+    ent.encode(bl);
+
+    // Insert an entry into bucket multipart index so it is not shown
+    // when listing a bucket.
+    string bucket_multipart_iname =
+      "motr.rgw.bucket." + obj->get_bucket()->get_name() + ".multiparts";
+    rc = store->do_idx_op_by_name(bucket_multipart_iname,
+                                  M0_IC_PUT, obj->get_key().to_str(), bl);
+
+  } while (rc == -EEXIST);
+
+  if (rc < 0)
+    return rc;
+
+  // Create object part index.
+  // TODO: add bucket as part of the name.
+  string obj_part_iname = "motr.rgw.object." + bucket->get_name() + "." + oid + ".parts";
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::init(): object part index = " << obj_part_iname << dendl;
+  rc = store->create_motr_idx_by_name(obj_part_iname);
+  if (rc < 0)
+    // TODO: clean the bucket index entry
+    ldpp_dout(dpp, 0) << "Failed to create object multipart index  " << obj_part_iname << dendl;
+
+  return rc;
 }
 
 int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *cct,
@@ -1453,9 +1878,64 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
 				     int *next_marker, bool *truncated,
 				     bool assume_unsorted)
 {
-  return 0; // TODO implement
+  int rc;
+  vector<string> key_vec(num_parts);
+  vector<bufferlist> val_vec(num_parts);
+
+  std::string oid = mp_obj.get_key();
+  string obj_part_iname = "motr.rgw.object." + bucket->get_name() + "." + oid + ".parts";
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): object part index = " << obj_part_iname << dendl;
+  key_vec[0].clear();
+  key_vec[0] = "part.";
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%08d", marker + 1);
+  key_vec[0].append(buf);
+  rc = store->next_query_by_name(obj_part_iname, key_vec, val_vec);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+    return rc;
+  }
+
+  int last_num = 0;
+  int part_cnt = 0;
+  uint32_t expected_next = marker + 1;
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): marker = " << marker << dendl;
+  for (const auto& bl: val_vec) {
+    if (bl.length() == 0)
+      break;
+
+    ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): get part_info "  << dendl;
+    RGWUploadPartInfo info;
+    auto iter = bl.cbegin();
+    info.decode(iter);
+
+    ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): part_num = " << info.num << dendl;
+    ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): part_size = " << info.size << dendl;
+
+    if (info.num != expected_next)
+      return -EINVAL;
+
+    if ((int)info.num > marker) {
+      last_num = info.num;
+      parts.emplace(info.num, std::make_unique<MotrMultipartPart>(info));
+    }
+
+    part_cnt++;
+    expected_next++;
+  }
+
+  // Does it have more parts?
+  if (truncated)
+    *truncated = part_cnt < num_parts? false : true;
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::list_parts(): truncated = " << *truncated << dendl;
+
+  if (next_marker)
+    *next_marker = last_num;
+
+  return 0;
 }
 
+// Heavily copy from rgw_sal_rados.cc
 int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
 				   optional_yield y, CephContext* cct,
 				   map<int, string>& part_etags,
@@ -1467,12 +1947,261 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
 				   rgw::sal::Object* target_obj,
 				   RGWObjectCtx* obj_ctx)
 {
-  return 0; // TODO implement
+  char final_etag[CEPH_CRYPTO_MD5_DIGESTSIZE];
+  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
+  std::string etag;
+  bufferlist etag_bl;
+  MD5 hash;
+  // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+  hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+  bool truncated;
+  int rc;
+
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): enter" << dendl;
+  int total_parts = 0;
+  int handled_parts = 0;
+  int max_parts = 1000;
+  int marker = 0;
+  uint64_t min_part_size = cct->_conf->rgw_multipart_min_part_size;
+  auto etags_iter = part_etags.begin();
+  rgw::sal::Attrs attrs = target_obj->get_attrs();
+
+  do {
+    ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): list_parts()" << dendl;
+    rc = list_parts(dpp, cct, max_parts, marker, &marker, &truncated);
+    if (rc == -ENOENT) {
+      rc = -ERR_NO_SUCH_UPLOAD;
+    }
+    if (rc < 0)
+      return rc;
+
+    total_parts += parts.size();
+    if (!truncated && total_parts != (int)part_etags.size()) {
+      ldpp_dout(dpp, 0) << "NOTICE: total parts mismatch: have: " << total_parts
+		       << " expected: " << part_etags.size() << dendl;
+      rc = -ERR_INVALID_PART;
+      return rc;
+    }
+    ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): parts.size() = " << parts.size() << dendl;
+
+    for (auto obj_iter = parts.begin();
+         etags_iter != part_etags.end() && obj_iter != parts.end();
+	 ++etags_iter, ++obj_iter, ++handled_parts) {
+      MultipartPart *mpart = obj_iter->second.get();
+      MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
+      RGWUploadPartInfo *part = &mmpart->info;
+
+      ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): part_size " << part->size << dendl;
+      uint64_t part_size = part->size;
+      if (handled_parts < (int)part_etags.size() - 1 &&
+          part_size < min_part_size) {
+        rc = -ERR_TOO_SMALL;
+        return rc;
+      }
+
+      char petag[CEPH_CRYPTO_MD5_DIGESTSIZE];
+      if (etags_iter->first != (int)obj_iter->first) {
+        ldpp_dout(dpp, 0) << "NOTICE: parts num mismatch: next requested: "
+			 << etags_iter->first << " next uploaded: "
+			 << obj_iter->first << dendl;
+        rc = -ERR_INVALID_PART;
+        return rc;
+      }
+      string part_etag = rgw_string_unquote(etags_iter->second);
+      if (part_etag.compare(part->etag) != 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: etag mismatch: part: " << etags_iter->first
+			 << " etag: " << etags_iter->second << dendl;
+        rc = -ERR_INVALID_PART;
+        return rc;
+      }
+
+      hex_to_buf(part->etag.c_str(), petag,
+		CEPH_CRYPTO_MD5_DIGESTSIZE);
+      hash.Update((const unsigned char *)petag, sizeof(petag));
+      ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): calc etag " << dendl;
+
+      string oid = mp_obj.get_part(part->num);
+      rgw_obj src_obj;
+      src_obj.init_ns(bucket->get_key(), oid, mp_ns);
+
+#if 0 // does Motr backend need it?
+      /* update manifest for part */
+      if (part->manifest.empty()) {
+        ldpp_dout(dpp, 0) << "ERROR: empty manifest for object part: obj="
+			 << src_obj << dendl;
+        rc = -ERR_INVALID_PART;
+        return rc;
+      } else {
+        manifest.append(dpp, part->manifest, store->get_zone());
+      }
+      ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): manifest " << dendl;
+#endif
+
+      bool part_compressed = (part->cs_info.compression_type != "none");
+      if ((handled_parts > 0) &&
+          ((part_compressed != compressed) ||
+            (cs_info.compression_type != part->cs_info.compression_type))) {
+          ldpp_dout(dpp, 0) << "ERROR: compression type was changed during multipart upload ("
+                           << cs_info.compression_type << ">>" << part->cs_info.compression_type << ")" << dendl;
+          rc = -ERR_INVALID_PART;
+          return rc;
+      }
+
+      ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): part compression" << dendl;
+      if (part_compressed) {
+        int64_t new_ofs; // offset in compression data for new part
+        if (cs_info.blocks.size() > 0)
+          new_ofs = cs_info.blocks.back().new_ofs + cs_info.blocks.back().len;
+        else
+          new_ofs = 0;
+        for (const auto& block : part->cs_info.blocks) {
+          compression_block cb;
+          cb.old_ofs = block.old_ofs + cs_info.orig_size;
+          cb.new_ofs = new_ofs;
+          cb.len = block.len;
+          cs_info.blocks.push_back(cb);
+          new_ofs = cb.new_ofs + cb.len;
+        }
+        if (!compressed)
+          cs_info.compression_type = part->cs_info.compression_type;
+        cs_info.orig_size += part->cs_info.orig_size;
+        compressed = true;
+      }
+
+      // We may not need to do the following as remove_objs are those
+      // don't show when listing a bucket. As we store in-progress uploaded
+      // object's metadata in a separate index, they are not shown when
+      // listing a bucket.
+      rgw_obj_index_key remove_key;
+      src_obj.key.get_index_key(&remove_key);
+      remove_objs.push_back(remove_key);
+
+      off += part->size;
+      accounted_size += part->accounted_size;
+      ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): off = " << off << ", accounted_size = " << accounted_size << dendl;
+    }
+  } while (truncated);
+  hash.Final((unsigned char *)final_etag);
+
+  buf_to_hex((unsigned char *)final_etag, sizeof(final_etag), final_etag_str);
+  snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2],
+	   sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2,
+           "-%lld", (long long)part_etags.size());
+  etag = final_etag_str;
+  ldpp_dout(dpp, 0) << "calculated etag: " << etag << dendl;
+  etag_bl.append(etag);
+  attrs[RGW_ATTR_ETAG] = etag_bl;
+
+  if (compressed) {
+    // write compression attribute to full object
+    bufferlist tmp;
+    encode(cs_info, tmp);
+    attrs[RGW_ATTR_COMPRESSION] = tmp;
+  }
+
+  // Read the object's the multipart_upload_info.
+  // TODO: all those index name and key  constructions should be implemented as
+  // member functions.
+  bufferlist bl;
+  std::unique_ptr<rgw::sal::Object> meta_obj;
+  meta_obj = get_meta_obj();
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
+  rc = this->store->do_idx_op_by_name(bucket_multipart_iname,
+                                      M0_IC_GET, meta_obj->get_key().to_str(), bl);
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): read entry from bucket multipart index " << rc << dendl;
+  if (rc < 0)
+    return rc;
+  rgw_bucket_dir_entry ent;
+  bufferlist& blr = bl;
+  auto ent_iter = blr.cbegin();
+  ent.decode(ent_iter);
+
+  // Update the dir entry and insert it to the bucket index so
+  // the object will be seen when listing the bucket.
+  bufferlist update_bl;
+  target_obj->get_key().get_index_key(&ent.key);  // Change to offical name :)
+  ent.meta.size = off;
+  ent.meta.accounted_size = accounted_size;
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): obj size =  " << ent.meta.size << dendl;
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): obj accounted size =  " << ent.meta.accounted_size << dendl;
+  ent.meta.mtime = ceph::real_clock::now();
+  ent.meta.etag = etag;
+  ent.encode(update_bl);
+  string bucket_index_iname = "motr.rgw.bucket.index." + meta_obj->get_bucket()->get_name();
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): target_obj name =  " << target_obj->get_name() << dendl;
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): target_obj oid =  " << target_obj->get_oid() << dendl;
+  rc = store->do_idx_op_by_name(bucket_index_iname, M0_IC_PUT,
+                                target_obj->get_name(), update_bl);
+  if (rc < 0)
+    return rc;
+
+  // Now we can remove it from bucket multipart index.
+  ldpp_dout(dpp, 0) << "MotrMultipartUpload::complete(): remove from bucket multipartindex " << dendl;
+  return store->do_idx_op_by_name(bucket_multipart_iname,
+                                  M0_IC_DEL, meta_obj->get_key().to_str(), bl);
 }
 
 int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield y, RGWObjectCtx* obj_ctx, rgw_placement_rule** rule, rgw::sal::Attrs* attrs)
 {
-  return 0; // TODO implement
+  if (!rule && !attrs) {
+    return 0;
+  }
+
+  if (rule) {
+    if (!placement.empty()) {
+      *rule = &placement;
+      if (!attrs) {
+	/* Don't need attrs, done */
+	return 0;
+      }
+    } else {
+      *rule = nullptr;
+    }
+  }
+
+  std::unique_ptr<rgw::sal::Object> meta_obj;
+  meta_obj = get_meta_obj();
+  meta_obj->set_in_extra_data(true);
+
+  // Read the object's the multipart_upload_info.
+  bufferlist bl;
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
+  int rc = this->store->do_idx_op_by_name(bucket_multipart_iname,
+                                          M0_IC_GET, meta_obj->get_key().to_str(), bl);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+    return rc;
+  }
+
+  rgw_bucket_dir_entry ent;
+  bufferlist& blr = bl;
+  auto ent_iter = blr.cbegin();
+  ent.decode(ent_iter);
+
+  if (attrs) {
+    bufferlist etag_bl;
+    string& etag = ent.meta.etag;
+    ldpp_dout(dpp, 0) << "object's etag:  " << ent.meta.etag << dendl;
+    etag_bl.append(etag.c_str(), etag.size());
+    attrs->emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
+    if (!rule || *rule != nullptr) {
+      /* placement was cached; don't actually read */
+      return 0;
+    }
+  }
+
+  /* Decode multipart_upload_info */
+  motr_multipart_upload_info upload_info;
+  bufferlist mpbl;
+  mpbl.append(ent.meta.user_data.c_str(), ent.meta.user_data.size());
+  auto mpbl_iter = mpbl.cbegin();
+  upload_info.decode(mpbl_iter);
+  placement = upload_info.dest_placement;
+  *rule = &placement;
+
+  return 0;
 }
 
 std::unique_ptr<Writer> MotrMultipartUpload::get_writer(
@@ -1491,12 +2220,33 @@ std::unique_ptr<Writer> MotrMultipartUpload::get_writer(
 
 int MotrMultipartWriter::prepare(optional_yield y)
 {
-  return 0;
+  string part_obj_name = head_obj->get_bucket()->get_name() + "." +
+	                 head_obj->get_key().to_str() +
+	                 ".part." + std::to_string(part_num);
+  ldpp_dout(dpp, 0) << "bucket = " << head_obj->get_bucket()->get_name() << "part_obj_name = " << part_obj_name << dendl;
+  part_obj = std::make_unique<MotrObject>(this->store, rgw_obj_key(part_obj_name), head_obj->get_bucket());
+  if (part_obj == nullptr)
+    return -ENOMEM;
+
+  // s3 client may retry uploading part, so the part may have already
+  // been created.
+  int rc = part_obj->create_mobj(dpp, store->cctx->_conf->rgw_max_chunk_size);
+  if (rc == -EEXIST) {
+    rc = part_obj->open_mobj(dpp);
+    if (rc < 0)
+      return rc;
+  }
+  return rc;
 }
 
 int MotrMultipartWriter::process(bufferlist&& data, uint64_t offset)
 {
-  return 0;
+  int rc = part_obj->write_mobj(dpp, std::move(data), offset);
+  if (rc == 0) {
+    actual_part_size += data.length();
+    ldpp_dout(dpp, 0) << " write_mobj(): actual_part_size = " << actual_part_size << dendl;
+  }
+  return rc;
 }
 
 int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag,
@@ -1508,9 +2258,42 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
                        rgw_zone_set *zones_trace, bool *canceled,
                        optional_yield y)
 {
+  // Should the dir entry(object metadata) be updated? For example
+  // mtime.
+
+  ldpp_dout(dpp, 0) << "MotrMultipartWriter::complete(): enter " << dendl;
+  // Add an entry into object_nnn_part_index.
+  bufferlist bl;
+  RGWUploadPartInfo info;
+  info.num = part_num;
+  info.etag = etag;
+  info.size = actual_part_size;
+  info.accounted_size = accounted_size;
+  info.modified = real_clock::now();
+
+  bool compressed;
+  int rc = rgw_compression_info_from_attrset(attrs, compressed, info.cs_info);
+  ldpp_dout(dpp, 0) << "MotrMultipartWriter::complete(): compression rc =  " << rc << dendl;
+  if (rc < 0) {
+    ldpp_dout(dpp, 1) << "cannot get compression info" << dendl;
+    return rc;
+  }
+  encode(info, bl);
+
+  string p = "part.";
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%08d", (int)part_num);
+  p.append(buf);
+  string obj_part_iname = "motr.rgw.object." + head_obj->get_bucket()->get_name() + "." +
+	                  head_obj->get_key().to_str() + ".parts";
+  ldpp_dout(dpp, 0) << "MotrMultipartWriter::complete(): object part index = " << obj_part_iname << dendl;
+  rc = store->do_idx_op_by_name(obj_part_iname, M0_IC_PUT, p, bl);
+  if (rc < 0) {
+    return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
+  }
+
   return 0;
 }
-
 
 std::unique_ptr<RGWRole> MotrStore::get_role(std::string name,
     std::string tenant,
@@ -1735,22 +2518,23 @@ int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
   // TODO: how to handle zone and multi-site.
 
   if (!*existed) {
-      info.placement_rule = placement_rule;
-      info.bucket = b;
-      info.owner = u->get_info().user_id;
-      info.zonegroup = zonegroup_id;
-      if (obj_lock_enabled)
-        info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
-      bucket->set_version(ep_objv);
-      bucket->get_info() = info;
+    info.placement_rule = placement_rule;
+    info.bucket = b;
+    info.owner = u->get_info().user_id;
+    info.zonegroup = zonegroup_id;
+    if (obj_lock_enabled)
+      info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
 
-// Create a new bucket: (1) Add a key/value pair in the
-      // bucket instance index. (2) Create a new bucket index.
-      MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
-      ret = mbucket->put_info(dpp, false, ceph::real_time())? :
-            mbucket->create_bucket_index();
-      if (ret < 0)
-        ldout(cctx, 0) << "ERROR: failed to create bucket instance index! " << ret << dendl;
+    // Create a new bucket: (1) Add a key/value pair in the
+    // bucket instance index. (2) Create a new bucket index.
+    MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
+    ret = mbucket->put_info(dpp, y, ceph::real_time())? :
+          mbucket->create_bucket_index() ? :
+          mbucket->create_multipart_indices();
+    if (ret < 0)
+      ldout(cctx, 0) << "ERROR: failed to create bucket indices! " << ret << dendl;
 
      // Insert the bucket entry into the user info index.
      ret = mbucket->link_user(dpp, u, y);
@@ -2168,6 +2952,35 @@ int MotrStore::next_query_by_name(string idx_name,
 out:
   m0_idx_fini(&idx);
   return rc < 0 ? rc : i + k;
+}
+
+int MotrStore::delete_motr_idx_by_name(string iname)
+{
+  struct m0_idx idx;
+  struct m0_uint128 idx_id;
+  struct m0_op *op = NULL;
+
+  index_name_to_motr_fid(iname, &idx_id);
+  m0_idx_init(&idx, &container.co_realm, &idx_id);
+  m0_entity_open(&idx.in_entity, &op);
+  int rc = m0_entity_delete(&idx.in_entity, &op);
+  if (rc < 0)
+    goto out;
+
+  m0_op_launch(&op, 1);
+  rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
+       m0_rc(op);
+  m0_op_fini(op);
+  m0_op_free(op);
+
+  if (rc == -ENOENT) // race deletion??
+    rc = 0;
+  else if (rc < 0)
+    ldout(cctx, 0) << "ERROR: index create failed: " << rc << dendl;
+
+out:
+  m0_idx_fini(&idx);
+  return rc;
 }
 
 int MotrStore::open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx)

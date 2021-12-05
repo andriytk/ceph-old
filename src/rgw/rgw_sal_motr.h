@@ -235,6 +235,7 @@ class MotrBucket : public Bucket {
     int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
     int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
     int create_bucket_index();
+    int create_multipart_indices();
     virtual int get_bucket_stats(const DoutPrefixProvider *dpp, int shard_id,
         string *bucket_ver, string *master_ver,
         map<RGWObjCategory, RGWStorageStats>& stats,
@@ -361,7 +362,14 @@ class MotrObject : public Object {
      */
     RGWObjState *state;
 
+    RGWObjCategory category;
     uint64_t layout_id;
+
+    // If this object is pat of a multipart uploaded one.
+    // TODO: do it in another class? MotrPartObject : public MotrObject
+    uint64_t part_off;
+    uint64_t part_size;
+    uint64_t part_num;
 
   public:
 
@@ -372,6 +380,10 @@ class MotrObject : public Object {
       private:
         MotrObject* source;
         RGWObjectCtx* rctx;
+
+	// The set of part objects if the source is
+	// a multipart uploaded object.
+        std::map<int, std::unique_ptr<MotrObject>> part_objs;
 
       public:
         MotrReadOp(MotrObject *_source, RGWObjectCtx *_rctx);
@@ -488,8 +500,30 @@ class MotrObject : public Object {
     int open_mobj(const DoutPrefixProvider *dpp);
     int delete_mobj(const DoutPrefixProvider *dpp);
     void close_mobj();
+    int write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uint64_t offset);
+    int read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t end, RGWGetDataCB* cb);
     unsigned get_optimal_bs(unsigned len);
     void obj_name_to_motr_fid(struct m0_uint128 *obj_fid);
+
+    int get_part_objs(const DoutPrefixProvider *dpp,
+                      std::map<int, std::unique_ptr<MotrObject>>& part_objs);
+    int open_part_objs(const DoutPrefixProvider* dpp,
+                       std::map<int, std::unique_ptr<MotrObject>>& part_objs);
+    int read_multipart_obj(const DoutPrefixProvider* dpp,
+                           int64_t off, int64_t end, RGWGetDataCB* cb,
+                           std::map<int, std::unique_ptr<MotrObject>>& part_objs);
+    int delete_part_objs(const DoutPrefixProvider* dpp);
+};
+
+// A placeholder locking class for multipart upload.
+// TODO: implement it using Motr object locks.
+class MPMotrSerializer : public MPSerializer {
+
+  public:
+    MPMotrSerializer(const DoutPrefixProvider *dpp, MotrStore* store, MotrObject* obj, const std::string& lock_name) {}
+
+    virtual int try_lock(const DoutPrefixProvider *dpp, utime_t dur, optional_yield y) override {return 0; }
+    virtual int unlock() override { return 0;}
 };
 
 class MotrAtomicWriter : public Writer {
@@ -544,6 +578,15 @@ class MotrMultipartWriter : public Writer {
 protected:
   rgw::sal::MotrStore* store;
 
+  // Head object.
+  std::unique_ptr<rgw::sal::Object> head_obj;
+
+  // Part parameters.
+  const uint64_t part_num;
+  const std::string part_num_str;
+  std::unique_ptr<MotrObject> part_obj;
+  uint64_t actual_part_size = 0;
+
 public:
   MotrMultipartWriter(const DoutPrefixProvider *dpp,
 		       optional_yield y, MultipartUpload* upload,
@@ -551,10 +594,11 @@ public:
 		       MotrStore* _store,
 		       const rgw_user& owner, RGWObjectCtx& obj_ctx,
 		       const rgw_placement_rule *ptail_placement_rule,
-		       uint64_t part_num, const std::string& part_num_str) :
-				  Writer(dpp, y),
-				  store(_store)
-  {}
+		       uint64_t _part_num, const std::string& part_num_str) :
+				  Writer(dpp, y), store(_store), head_obj(std::move(_head_obj)),
+				  part_num(_part_num), part_num_str(part_num_str)
+  {
+  }
   ~MotrMultipartWriter() = default;
 
   // prepare to start processing object data
@@ -572,6 +616,50 @@ public:
                        const std::string *user_data,
                        rgw_zone_set *zones_trace, bool *canceled,
                        optional_yield y) override;
+};
+
+// The implementation of multipart upload in POC roughly follows the
+// cortx-s3server's design. Parts are stored in separate Motr objects.
+// s3server uses a few auxiliary Motr indices to manage multipart
+// related metadata: (1) Bucket multipart index (bucket_nnn_multipart_index)
+// which contains metadata that answers questions such as which objects have
+// started  multipart upload and its upload id. This index is created during
+// bucket creation. (2) Bbject part index (object_nnn_part_index) which stores
+// metadata of a part's details (size, pvid, oid...). This index is created in
+// MotrMultipartUpload::init(). (3) Extended metadata index
+// (bucket_nnn_extended_metadata): once parts has been uploaded and their
+// metadata saved in the part index, the user may issue multipart completion
+// request. When processing the completion request, the parts are read from
+// object part index and for each part an entry is created in extended index.
+// The entry for the object is created in bucket (object list) index. The part
+// index is deleted and an entry removed from bucket_nnn_multipart_index. Like
+// bucket multipart index, bucket part extened metadata index is created during
+// bucket creation.
+//
+// The extended metadata index is used mainly due to fault tolerant
+// considerations (how to handle Motr service crash when uploading an object)
+// and to avoid to create too many Motr indices (I am not sure I understand
+// why many Motr indices is bad.). In our POC, to keep it simple, only 2
+// indices are maintained: bucket multipart index and object_nnn_part_index.
+//
+//
+
+class MotrMultipartPart : public MultipartPart {
+protected:
+  RGWUploadPartInfo info;
+
+public:
+  MotrMultipartPart(RGWUploadPartInfo _info) : info(_info) {}
+  virtual ~MotrMultipartPart() = default;
+
+  virtual uint32_t get_num() { return info.num; }
+  virtual uint64_t get_size() { return info.accounted_size; }
+  virtual const std::string& get_etag() { return info.etag; }
+  virtual ceph::real_time& get_mtime() { return info.modified; }
+
+  RGWObjManifest& get_manifest() { return info.manifest; }
+
+  friend class MotrMultipartUpload;
 };
 
 class MotrMultipartUpload : public MultipartUpload {
@@ -615,6 +703,7 @@ public:
 			  const rgw_placement_rule *ptail_placement_rule,
 			  uint64_t part_num,
 			  const std::string& part_num_str) override;
+  int delete_parts(const DoutPrefixProvider *dpp);
 };
 
 class MotrStore : public Store {
@@ -723,7 +812,7 @@ class MotrStore : public Store {
     virtual int get_oidc_providers(const DoutPrefixProvider *dpp,
         const string& tenant,
         vector<std::unique_ptr<RGWOIDCProvider>>& providers) override;
-    virtual std::unique_ptr<MultipartUpload> get_multipart_upload(Bucket* bucket, const string& oid, std::optional<string> upload_id, ceph::real_time mtime) override;
+    virtual std::unique_ptr<MultipartUpload> get_multipart_upload(Bucket* bucket, const std::string& oid, std::optional<std::string> upload_id=std::nullopt, ceph::real_time mtime=real_clock::now()) override;
     virtual std::unique_ptr<Writer> get_append_writer(const DoutPrefixProvider *dpp,
         optional_yield y,
         std::unique_ptr<rgw::sal::Object> _head_obj,
@@ -769,6 +858,7 @@ class MotrStore : public Store {
     void index_name_to_motr_fid(string iname, struct m0_uint128 *fid);
     int open_motr_idx(struct m0_uint128 *id, struct m0_idx *idx);
     int create_motr_idx_by_name(string iname);
+    int delete_motr_idx_by_name(string iname);
     int do_idx_op_by_name(string idx_name, enum m0_idx_opcode opcode,
                           string key_str, bufferlist &bl);
     int check_n_create_global_indices();
