@@ -46,11 +46,12 @@ static std::string motr_global_indices[] = {
   RGW_MOTR_BUCKET_HD_IDX_NAME
 };
 
+using ::ceph::encode;
+using ::ceph::decode;
+
 // TODO: properly handle the number of key/value pairs to get in
 // one query. Now the POC simply tries to retrieve all `max` number of pairs
 // with starting key `marker`.
-using ::ceph::encode;
-
 int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
     const string& end_marker, uint64_t max, bool need_stats,
     BucketList &buckets, optional_yield y)
@@ -788,11 +789,32 @@ int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
 
 int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj)
 {
-//    Motr::Object op_target(store->getDB(), get_bucket()->get_info(), get_obj());
-//    Motr::Object::Read read_op(&op_target);
-//
-//    return read_attrs(dpp, read_op, y, target_obj);
-  ldpp_dout(dpp, 0) << "DEBUG: MotrObject::get_obj_attrs()" << dendl;
+  string bname, key;
+  if (target_obj) {
+    bname = target_obj->bucket.name;
+    key   = target_obj->key.to_str();
+  } else {
+    bname = this->get_bucket()->get_name();
+    key   = this->get_key().to_str();
+  }
+  ldpp_dout(dpp, 0) << "MotrObject::get_obj_attrs(): "
+                    << bname << "/" << key << dendl;
+
+  // Get object's metadata (those stored in rgw_bucket_dir_entry).
+  bufferlist bl;
+  string bucket_index_iname = "motr.rgw.bucket.index." + bname;
+  int rc = this->store->do_idx_op_by_name(bucket_index_iname, M0_IC_GET, key, bl);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
+    return rc;
+  }
+
+  rgw_bucket_dir_entry ent;
+  bufferlist& blr = bl;
+  auto iter = blr.cbegin();
+  ent.decode(iter);
+  decode(attrs, iter);
+
   return 0;
 }
 
@@ -1699,14 +1721,30 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.mtime = real_clock::is_zero(set_mtime)? ceph::real_clock::now() : set_mtime;
   ent.meta.etag = etag;
   ent.meta.owner = owner.to_str();
+  ent.meta.owner_display_name = obj.get_bucket()->get_owner()->get_display_name();
   bool is_versioned = obj.get_key().have_instance();
   if (is_versioned)
     ent.flags = rgw_bucket_dir_entry::FLAG_VER | rgw_bucket_dir_entry::FLAG_CURRENT;
   ldpp_dout(dpp, 0) << "MotrAtomicWriter::complete(): key=" << obj.get_key().to_str()
-                    << " etag: " << etag << dendl;
+                    << " etag: " << etag << " user_data=" << user_data << dendl;
   if (user_data)
     ent.meta.user_data = *user_data;
   ent.encode(bl);
+
+  RGWBucketInfo &info = obj.get_bucket()->get_info();
+  if (info.obj_lock_enabled() && info.obj_lock.has_rule()) {
+    auto iter = attrs.find(RGW_ATTR_OBJECT_RETENTION);
+    if (iter == attrs.end()) {
+      real_time lock_until_date = info.obj_lock.get_lock_until_date(ent.meta.mtime);
+      string mode = info.obj_lock.get_mode();
+      RGWObjectRetention obj_retention(mode, lock_until_date);
+      bufferlist bl;
+      obj_retention.encode(bl);
+      attrs[RGW_ATTR_OBJECT_RETENTION] = bl;
+    }
+  }
+
+  encode(attrs, bl);
 
   if (is_versioned) {
     // get the list of all versioned objects with the same key and
