@@ -725,11 +725,11 @@ std::unique_ptr<LuaScriptManager> MotrStore::get_lua_script_manager()
   return std::make_unique<MotrLuaScriptManager>(this);
 }
 
-int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, RGWObjState **state, optional_yield y, bool follow_olh)
+int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, RGWObjState **_state, optional_yield y, bool follow_olh)
 {
-  if (!*state) {
-    *state = new RGWObjState();
-  }
+  if (state == NULL)
+    state = new RGWObjState();
+  *_state = state;
 
   // Get object's metadata (those stored in rgw_bucket_dir_entry).
   bufferlist bl;
@@ -750,21 +750,24 @@ int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
   this->category = ent.meta.category;
 
   // Set object state.
-  RGWObjState *s = *state;
-  s->obj = get_obj();
-  s->exists = true;
-  s->size = ent.meta.size;
-  s->accounted_size = ent.meta.size;
-  s->mtime = ent.meta.mtime;
+  state->obj = get_obj();
+  state->exists = true;
+  state->size = ent.meta.size;
+  state->accounted_size = ent.meta.size;
+  state->mtime = ent.meta.mtime;
 
-  s->has_attrs = true;
+  state->has_attrs = true;
   bufferlist etag_bl;
   string& etag = ent.meta.etag;
   ldpp_dout(dpp, 0) << "object's etag:  " << ent.meta.etag << dendl;
-  etag_bl.append(etag.c_str(), etag.size());
-  s->attrset.emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
+  etag_bl.append(etag);
+  state->attrset[RGW_ATTR_ETAG] = etag_bl;
 
   return 0;
+}
+
+MotrObject::~MotrObject() {
+  delete state;
 }
 
 //  int MotrObject::read_attrs(const DoutPrefixProvider* dpp, Motr::Object::Read &read_op, optional_yield y, rgw_obj* target_obj)
@@ -2867,7 +2870,7 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
                               vector<vector<uint8_t>>& vals)
 {
   int rc;
-  uint32_t i;
+  uint32_t i = 0;
   int nr_kvp = vals.size();
   int *rcs = new int[nr_kvp];
   struct m0_bufvec k, v;
@@ -2913,7 +2916,7 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
 
 out:
   m0_bufvec_free(&k);
-  m0_bufvec_free(&v); // cleanup buffer after GET
+  m0_bufvec_free(&v);
 
   delete []rcs;
   return rc ?: i;
@@ -2927,7 +2930,7 @@ int MotrStore::next_query_by_name(string idx_name,
                                   string prefix, string delim)
 {
   unsigned nr_kvp = std::min(val_out.size(), 100UL);
-  struct m0_idx idx;
+  struct m0_idx idx = {};
   vector<vector<uint8_t>> keys(nr_kvp);
   vector<vector<uint8_t>> vals(nr_kvp);
   struct m0_uint128 idx_id;
@@ -3052,8 +3055,7 @@ void MotrStore::index_name_to_motr_fid(string iname, struct m0_uint128 *id)
 
   struct m0_fid *fid = (struct m0_fid*)id;
   m0_fid_tset(fid, m0_dix_fid_type.ft_id,
-              fid->f_container & M0_DIX_FID_DIX_CONTAINER_MASK,
-  fid->f_key);
+              fid->f_container & M0_DIX_FID_DIX_CONTAINER_MASK, fid->f_key);
   ldout(cctx, 0) << "converted id = 0x " << std::hex << id->u_hi << ":0x" << std::hex << id->u_lo  << dendl;
 }
 
@@ -3091,7 +3093,7 @@ out:
 
 int MotrStore::create_motr_idx_by_name(string iname)
 {
-  struct m0_idx idx;
+  struct m0_idx idx = {};
   struct m0_uint128 id;
 
   index_name_to_motr_fid(iname, &id);

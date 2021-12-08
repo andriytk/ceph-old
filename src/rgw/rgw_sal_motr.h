@@ -408,16 +408,13 @@ class MotrObject : public Object {
     MotrObject() = default;
 
     MotrObject(MotrStore *_st, const rgw_obj_key& _k)
-      : Object(_k),
-      store(_st),
-      acls() {
-      }
+      : Object(_k), store(_st), acls(), state(NULL) {}
     MotrObject(MotrStore *_st, const rgw_obj_key& _k, Bucket* _b)
-      : Object(_k, _b),
-      store(_st),
-      acls() {
-      }
+      : Object(_k, _b), store(_st), acls(), state(NULL) {}
+
     MotrObject(MotrObject& _o) = default;
+
+    virtual ~MotrObject();
 
     virtual int delete_object(const DoutPrefixProvider* dpp,
         RGWObjectCtx* obj_ctx,
