@@ -1168,9 +1168,36 @@ MotrAtomicWriter::MotrAtomicWriter(const DoutPrefixProvider *dpp,
               unique_tag(_unique_tag),
               obj(_store, _head_obj->get_key(), _head_obj->get_bucket()) {}
 
+static const unsigned MAX_BUFVEC_NR = 256;
+
+// Open existing object and allocate buffers.
+// If the object does not exist yet - no problem, we will create it
+// later at write(), after enough data is accumulated for it.
 int MotrAtomicWriter::prepare(optional_yield y)
 {
-  return 0;
+  total_data_size = 0;
+
+  if (obj.is_opened())
+    return 0;
+
+  int rc = obj.open_mobj(dpp);
+  if (rc != 0 && rc != -ENOENT) {
+    char fid_str[40];
+    snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&obj.fid));
+    ldpp_dout(dpp, 0) << "ERROR: failed to open motr object "
+      << fid_str << " (" << obj.get_bucket()->get_name()
+      << "/" << obj.get_key().to_str() << "): rc=" << rc
+      << dendl;
+    return rc;
+  }
+
+  rc = m0_bufvec_empty_alloc(&buf, MAX_BUFVEC_NR) ?:
+    m0_bufvec_alloc(&attr, MAX_BUFVEC_NR, 1) ?:
+    m0_indexvec_alloc(&ext, MAX_BUFVEC_NR);
+  if (rc != 0)
+    this->cleanup();
+
+  return rc;
 }
 
 void MotrObject::obj_name_to_motr_fid(struct m0_uint128 *obj_fid)
@@ -1313,7 +1340,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
   unsigned bs, left;
   struct m0_op *op;
   char *start, *p;
-  bufferlist cdata, cdata_tail;
+  bufferlist cdata, tail;
   struct m0_bufvec buf;
   struct m0_bufvec attr;
   struct m0_indexvec ext;
@@ -1344,8 +1371,8 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
     if (left < bs) {
       cdata.append_zero(bs - left);
       left = bs;
-      cdata.splice(p - start, bs, &cdata_tail);
-      p = cdata_tail.c_str();
+      cdata.splice(p - start, bs, &tail);
+      p = tail.c_str();
     }
     buf.ov_buf[0] = p;
     buf.ov_vec.v_count[0] = bs;
@@ -1498,6 +1525,7 @@ int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
       mobj->part_off = off;
       mobj->part_size = part_size;
       mobj->part_num = part_num;
+
       part_objs.emplace(part_num, std::move(mobj));
 
       off += part_size;
@@ -1614,24 +1642,45 @@ void MotrAtomicWriter::cleanup()
   m0_bufvec_free(&attr);
   m0_bufvec_free2(&buf);
 
-  obj.close_mobj();
+  acc_bl.clear();
+
+  if (obj.is_opened())
+    obj.close_mobj();
 }
 
-int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
+unsigned MotrAtomicWriter::populate_bvec(unsigned len, bufferlist::iterator &bi)
+{
+  unsigned i, l, done = 0;
+  const char *data;
+
+  for (i = 0; i < MAX_BUFVEC_NR && len > 0; ++i) {
+    l = bi.get_ptr_and_advance(len, &data);
+    buf.ov_buf[i] = (char*)data;
+    buf.ov_vec.v_count[i] = l;
+    ext.iv_index[i] = acc_off;
+    ext.iv_vec.v_count[i] = l;
+    attr.ov_vec.v_count[i] = 0;
+    acc_off += l;
+    len -= l;
+    done += l;
+  }
+  buf.ov_vec.v_nr = i;
+  ext.iv_vec.v_nr = i;
+
+  return done;
+}
+
+int MotrAtomicWriter::write()
 {
   int rc;
   unsigned bs, left;
   struct m0_op *op;
-  char *start, *p;
-  bufferlist cdata, cdata_tail;
+  bufferlist::iterator bi;
 
-  left = data.length();
+  left = acc_bl.length();
 
-  if (left == 0)
-    return 0;
-
-  if (total_data_size == 0 && left > 0 && !obj.is_opened()) {
-    rc = obj.create_mobj(dpp, data.length());
+  if (!obj.is_opened()) {
+    rc = obj.create_mobj(dpp, left);
     if (rc == -EEXIST)
       rc = obj.open_mobj(dpp);
     if (rc != 0) {
@@ -1641,13 +1690,8 @@ int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
                         << fid_str << " (" << obj.get_bucket()->get_name()
                         << "/" << obj.get_key().to_str() << "): rc=" << rc
                         << dendl;
-      return rc;
-    }
-    rc = m0_bufvec_empty_alloc(&buf, 1) ?:
-         m0_bufvec_alloc(&attr, 1, 1) ?:
-         m0_indexvec_alloc(&ext, 1);
-    if (rc != 0)
       goto err;
+    }
   }
 
   total_data_size += left;
@@ -1655,27 +1699,16 @@ int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
   bs = obj.get_optimal_bs(left);
   ldpp_dout(dpp, 0) << "DEBUG: left=" << left << " bs=" << bs << dendl;
 
-  if (!data.is_contiguous())
-    data.splice(0, left, &cdata);
-  else
-    cdata = data;
-
-  start = cdata.c_str();
-
-  for (p = start; left > 0; left -= bs, p += bs, offset += bs) {
+  bi = acc_bl.begin();
+  while (left > 0) {
     if (left < bs)
       bs = obj.get_optimal_bs(left);
     if (left < bs) {
-      cdata.append_zero(bs - left);
+      acc_bl.append_zero(bs - left);
       left = bs;
-      cdata.splice(p - start, bs, &cdata_tail);
-      p = cdata_tail.c_str();
     }
-    buf.ov_buf[0] = p;
-    buf.ov_vec.v_count[0] = bs;
-    ext.iv_index[0] = offset;
-    ext.iv_vec.v_count[0] = bs;
-    attr.ov_vec.v_count[0] = 0;
+
+    left -= this->populate_bvec(bs, bi);
 
     op = NULL;
     rc = m0_obj_op(obj.mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
@@ -1689,12 +1722,34 @@ int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
     if (rc != 0)
       goto err;
   }
+  acc_bl.clear();
 
   return 0;
 
 err:
   this->cleanup();
   return rc;
+}
+
+static const unsigned MAX_ACC_SIZE = 32 * 1024 * 1024;
+
+// Accumulate enough data first to make a reasonable decision about the
+// optimal unit size for a new object, or bs for existing object (32M seems
+// enough for 4M units in 8+2 parity groups, a common config on wide pools),
+// and then launch the write operations.
+int MotrAtomicWriter::process(bufferlist&& data, uint64_t offset)
+{
+  if (data.length() == 0)
+    return 0;
+
+  if (acc_bl.length() == 0)
+    acc_off = offset;
+
+  acc_bl.append(std::move(data));
+  if (acc_bl.length() < MAX_ACC_SIZE)
+    return 0;
+
+  return this->write();
 }
 
 int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
@@ -1706,7 +1761,15 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
                        rgw_zone_set *zones_trace, bool *canceled,
                        optional_yield y)
 {
+  int rc = 0;
+
+  if (acc_bl.length() != 0)
+    rc = this->write();
+
   this->cleanup();
+
+  if (rc != 0)
+    return rc;
 
   bufferlist bl;
   rgw_bucket_dir_entry ent;
@@ -2193,8 +2256,8 @@ int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield 
     if (!placement.empty()) {
       *rule = &placement;
       if (!attrs) {
-	/* Don't need attrs, done */
-	return 0;
+        /* Don't need attrs, done */
+        return 0;
       }
     } else {
       *rule = nullptr;

@@ -531,12 +531,9 @@ class MotrAtomicWriter : public Writer {
   uint64_t olh_epoch;
   const string& unique_tag;
   MotrObject obj;
-  uint64_t total_data_size = 0; /* for total data being uploaded */
-  bufferlist head_data;
-  bufferlist tail_part_data;
-  uint64_t tail_part_offset;
-  uint64_t tail_part_size = 0; /* corresponds to each tail part being
-                                written to dbstore */
+  uint64_t total_data_size; // for total data being uploaded
+  bufferlist acc_bl;  // accumulated data
+  uint64_t   acc_off; // accumulated data offset
 
   struct m0_bufvec buf;
   struct m0_bufvec attr;
@@ -559,6 +556,8 @@ class MotrAtomicWriter : public Writer {
   // Process a bufferlist
   virtual int process(bufferlist&& data, uint64_t offset) override;
 
+  int write();
+
   // complete the operation and make its result visible to clients
   virtual int complete(size_t accounted_size, const string& etag,
                        ceph::real_time *mtime, ceph::real_time set_mtime,
@@ -568,6 +567,8 @@ class MotrAtomicWriter : public Writer {
                        const string *user_data,
                        rgw_zone_set *zones_trace, bool *canceled,
                        optional_yield y) override;
+
+  unsigned populate_bvec(unsigned len, bufferlist::iterator &bi);
   void cleanup();
 };
 
