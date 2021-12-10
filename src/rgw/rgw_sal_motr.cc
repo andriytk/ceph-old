@@ -1344,7 +1344,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
   unsigned bs, left;
   struct m0_op *op;
   char *start, *p;
-  bufferlist cdata, tail;
+  bufferlist tail;
   struct m0_bufvec buf;
   struct m0_bufvec attr;
   struct m0_indexvec ext;
@@ -1362,20 +1362,15 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
   bs = this->get_optimal_bs(left);
   ldpp_dout(dpp, 0) << "DEBUG: left=" << left << " bs=" << bs << dendl;
 
-  if (!data.is_contiguous())
-    data.splice(0, left, &cdata);
-  else
-    cdata = data;
-
-  start = cdata.c_str();
+  start = data.c_str();
 
   for (p = start; left > 0; left -= bs, p += bs, offset += bs) {
     if (left < bs)
       bs = this->get_optimal_bs(left);
     if (left < bs) {
-      cdata.append_zero(bs - left);
+      data.append_zero(bs - left);
       left = bs;
-      cdata.splice(p - start, bs, &tail);
+      data.splice(p - start, bs, &tail);
       p = tail.c_str();
     }
     buf.ov_buf[0] = p;
@@ -1709,6 +1704,12 @@ int MotrAtomicWriter::write()
       bs = obj.get_optimal_bs(left);
     if (left < bs) {
       acc_bl.append_zero(bs - left);
+      auto off = bi.get_off();
+      bufferlist tmp;
+      acc_bl.splice(off, bs, &tmp);
+      acc_bl.clear();
+      acc_bl.append(tmp.c_str(), bs); // make it a single buf
+      bi = acc_bl.begin();
       left = bs;
     }
 
