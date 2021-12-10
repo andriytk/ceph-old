@@ -510,6 +510,7 @@ class MotrObject : public Object {
                            int64_t off, int64_t end, RGWGetDataCB* cb,
                            std::map<int, std::unique_ptr<MotrObject>>& part_objs);
     int delete_part_objs(const DoutPrefixProvider* dpp);
+    void set_category(RGWObjCategory _category) {category = _category;}
 };
 
 // A placeholder locking class for multipart upload.

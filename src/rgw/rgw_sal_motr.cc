@@ -793,6 +793,9 @@ int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
 
 int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj)
 {
+  if (this->category == RGWObjCategory::MultiMeta)
+    return 0;
+
   string bname, key;
   if (target_obj) {
     bname = target_obj->bucket.name;
@@ -1893,7 +1896,10 @@ int MotrMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
 
 std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
 {
-  return bucket->get_object(rgw_obj_key(get_meta(), string(), mp_ns));
+  std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(rgw_obj_key(get_meta(), string(), mp_ns));
+  std::unique_ptr<rgw::sal::MotrObject> mobj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+  mobj->set_category(RGWObjCategory::MultiMeta);
+  return mobj;
 }
 
 struct motr_multipart_upload_info
