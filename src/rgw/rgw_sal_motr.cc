@@ -768,6 +768,7 @@ int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
 
 MotrObject::~MotrObject() {
   delete state;
+  this->close_mobj();
 }
 
 //  int MotrObject::read_attrs(const DoutPrefixProvider* dpp, Motr::Object::Read &read_op, optional_yield y, rgw_obj* target_obj)
@@ -1229,6 +1230,7 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
   M0_ASSERT(lid > 0);
 
+  M0_ASSERT(mobj == NULL);
   mobj = new (struct m0_obj)();
   m0_obj_init(mobj, &store->container.co_realm, &fid, lid);
 
@@ -1236,6 +1238,7 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   ldpp_dout(dpp, 0) << "create_mobj(): m0_entity_create() " << dendl;
   int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
   if (rc != 0) {
+    this->close_mobj();
     ldpp_dout(dpp, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
     return rc;
   }
@@ -1247,9 +1250,8 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   m0_op_free(op);
 
   if (rc != 0) {
+    this->close_mobj();
     ldpp_dout(dpp, 0) << "ERROR: failed to create motr object: " << rc << dendl;
-    delete mobj;
-    mobj = NULL;
     return rc;
   }
 
@@ -1262,6 +1264,7 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
 {
   this->obj_name_to_motr_fid(&fid);
 
+  M0_ASSERT(mobj == NULL);
   mobj = new (struct m0_obj);
   memset(mobj, 0, sizeof *mobj);
   m0_obj_init(mobj, &store->container.co_realm, &fid, store->conf.mc_layout_id);
@@ -1269,6 +1272,7 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   struct m0_op *op = NULL;
   int rc = m0_entity_open(&mobj->ob_entity, &op);
   if (rc != 0) {
+    this->close_mobj();
     ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: " << rc << dendl;
     return rc;
   }
@@ -1279,9 +1283,8 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   m0_op_free(op);
 
   if (rc < 0) {
+    this->close_mobj();
     ldpp_dout(dpp, 0) << "ERROR: failed to open motr object: " << rc << dendl;
-    delete mobj;
-    mobj = NULL;
     return rc;
   }
 
@@ -1319,8 +1322,7 @@ int MotrObject::delete_mobj(const DoutPrefixProvider *dpp)
   }
 
   // Clean up.
-  delete mobj;
-  mobj = NULL;
+  this->close_mobj();
   layout_id = 0;
   return 0;
 }
@@ -1330,8 +1332,7 @@ void MotrObject::close_mobj()
   if (mobj == NULL)
     return;
   m0_obj_fini(mobj);
-  delete mobj;
-  mobj = NULL;
+  delete mobj; mobj = NULL;
 }
 
 int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uint64_t offset)
