@@ -102,10 +102,89 @@ int MotrUser::list_buckets(const DoutPrefixProvider *dpp, const string& marker,
   return 0;
 }
 
-Bucket* MotrUser::create_bucket(rgw_bucket& bucket,
-    ceph::real_time creation_time)
+int MotrUser::create_bucket(const DoutPrefixProvider* dpp,
+                            const rgw_bucket& b,
+                            const std::string& zonegroup_id,
+                            rgw_placement_rule& placement_rule,
+                            std::string& swift_ver_location,
+                            const RGWQuotaInfo* pquota_info,
+                            const RGWAccessControlPolicy& policy,
+                            Attrs& attrs,
+                            RGWBucketInfo& info,
+                            obj_version& ep_objv,
+                            bool exclusive,
+                            bool obj_lock_enabled,
+                            bool* existed,
+                            req_info& req_info,
+                            std::unique_ptr<Bucket>* bucket_out,
+                            optional_yield y)
 {
-  return NULL;
+  int ret;
+  std::unique_ptr<Bucket> bucket;
+
+  // Look up the bucket. Create it if it doesn't exist.
+  ret = this->store->get_bucket(dpp, this, b, &bucket, y);
+  if (ret < 0 && ret != -ENOENT)
+    return ret;
+
+  if (ret != -ENOENT) {
+    *existed = true;
+    if (swift_ver_location.empty()) {
+      swift_ver_location = bucket->get_info().swift_ver_location;
+    }
+    placement_rule.inherit_from(bucket->get_info().placement_rule);
+
+    // TODO: ACL policy
+    // // don't allow changes to the acl policy
+    //RGWAccessControlPolicy old_policy(ctx());
+    //int rc = rgw_op_get_bucket_policy_from_attr(
+    //           dpp, this, u, bucket->get_attrs(), &old_policy, y);
+    //if (rc >= 0 && old_policy != policy) {
+    //    bucket_out->swap(bucket);
+    //    return -EEXIST;
+    //}
+  } else {
+    placement_rule.name = "default";
+    placement_rule.storage_class = "STANDARD";
+    bucket = std::make_unique<MotrBucket>(store, b, this);
+    bucket->set_attrs(attrs);
+
+    *existed = false;
+  }
+
+  // TODO: how to handle zone and multi-site.
+
+  if (!*existed) {
+    info.placement_rule = placement_rule;
+    info.bucket = b;
+    info.owner = this->get_info().user_id;
+    info.zonegroup = zonegroup_id;
+    if (obj_lock_enabled)
+      info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
+
+    // Create a new bucket: (1) Add a key/value pair in the
+    // bucket instance index. (2) Create a new bucket index.
+    MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
+    ret = mbucket->put_info(dpp, y, ceph::real_time())? :
+          mbucket->create_bucket_index() ? :
+          mbucket->create_multipart_indices();
+    if (ret < 0)
+      ldpp_dout(dpp, 0) << "ERROR: failed to create bucket indices! " << ret << dendl;
+
+     // Insert the bucket entry into the user info index.
+     ret = mbucket->link_user(dpp, this, y);
+     if (ret < 0)
+       ldpp_dout(dpp, 0) << "ERROR: failed to add bucket entry! " << ret << dendl;
+  } else {
+    bucket->set_version(ep_objv);
+    bucket->get_info() = info;
+  }
+
+  bucket_out->swap(bucket);
+
+  return ret;
 }
 
 int MotrUser::read_attrs(const DoutPrefixProvider* dpp, optional_yield y)
@@ -255,11 +334,11 @@ int MotrUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)
   return 0;
 }
 
-int MotrBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, std::string prefix, std::string delimiter, bool forward_to_master, req_info* req_info, optional_yield y)
+int MotrBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y)
 {
   int ret;
 
-  ret = get_bucket_info(dpp, y);
+  ret = load_bucket(dpp, y);
   if (ret < 0)
     return ret;
 
@@ -294,14 +373,14 @@ int MotrBucket::put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::re
                                   M0_IC_PUT, info.bucket.name, bl);
 }
 
-int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
+int MotrBucket::load_bucket(const DoutPrefixProvider *dpp, optional_yield y)
 {
   // Get bucket instance using bucket's name (string). or bucket id?
   bufferlist bl;
-  ldpp_dout(dpp, 0) << "get_bucket_info(): name=" << info.bucket.name << dendl;
+  ldpp_dout(dpp, 0) << "load_bucket(): name=" << info.bucket.name << dendl;
   int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
                                     M0_IC_GET, info.bucket.name, bl);
-  ldpp_dout(dpp, 0) << "get_bucket_info(): rc=" << rc << dendl;
+  ldpp_dout(dpp, 0) << "load_bucket(): rc=" << rc << dendl;
   if (rc < 0)
       return rc;
 
@@ -311,7 +390,7 @@ int MotrBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y)
   mbinfo.decode(iter); //Decode into MotrBucketInfo.
 
   info = mbinfo.info;
-  ldpp_dout(dpp, 0) << "get_bucket_info(): bucket_id=" << info.bucket.bucket_id << dendl;
+  ldpp_dout(dpp, 0) << "load_bucket(): bucket_id=" << info.bucket.bucket_id << dendl;
   rgw_placement_rule placement_rule;
   placement_rule.name = "default";
   placement_rule.storage_class = "STANDARD";
@@ -357,7 +436,7 @@ int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, User* new_user, optio
 }
 
 /* stats - Not for first pass */
-int MotrBucket::get_bucket_stats(const DoutPrefixProvider *dpp, int shard_id,
+int MotrBucket::read_stats(const DoutPrefixProvider *dpp, int shard_id,
     std::string *bucket_ver, std::string *master_ver,
     std::map<RGWObjCategory, RGWStorageStats>& stats,
     std::string *max_marker, bool *syncstopped)
@@ -393,12 +472,7 @@ int MotrBucket::create_multipart_indices()
 }
 
 
-int MotrBucket::get_bucket_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
-{
-  return 0;
-}
-
-int MotrBucket::read_bucket_stats(const DoutPrefixProvider *dpp, optional_yield y)
+int MotrBucket::read_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
 {
   return 0;
 }
@@ -428,17 +502,7 @@ int MotrBucket::chown(const DoutPrefixProvider *dpp, User* new_user, User* old_u
   return ret;
 }
 
-int MotrBucket::remove_metadata(const DoutPrefixProvider* dpp, RGWObjVersionTracker* objv, optional_yield y)
-{
-  /* XXX: same as MotrBUcket::remove_bucket() but should return error if there are objects
-   * in that bucket. */
-
-  //int ret = store->getDB()->remove_bucket(dpp, info);
-
-  return 0;
-}
-
-/* Make sure to call get_bucket_info() if you need it first */
+/* Make sure to call load_bucket() if you need it first */
 bool MotrBucket::is_owner(User* user)
 {
   return (info.owner.compare(user->get_id()) == 0);
@@ -474,7 +538,7 @@ int MotrBucket::try_refresh_info(const DoutPrefixProvider *dpp, ceph::real_time 
 {
   int ret = 0;
 
-//    ret = store->getDB()->get_bucket_info(dpp, string("name"), "", info, &attrs,
+//    ret = store->getDB()->load_bucket(dpp, string("name"), "", info, &attrs,
 //        pmtime, &bucket_version);
 
   return ret;
@@ -641,7 +705,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
     }
 
     rgw_obj_key key(ent.key);
-    uploads.push_back(store->get_multipart_upload(this, key.name));
+    uploads.push_back(this->get_multipart_upload(key.name));
     last_obj_key = key;
     ocount++;
     if (ocount == max_uploads) {
@@ -657,9 +721,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
 
 }
 
-int MotrBucket::abort_multiparts(const DoutPrefixProvider *dpp,
-       CephContext *cct,
-       string& prefix, string& delim)
+int MotrBucket::abort_multiparts(const DoutPrefixProvider *dpp, CephContext *cct)
 {
   return 0;
 }
@@ -848,16 +910,6 @@ int MotrObject::delete_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rc
   return set_obj_attrs(dpp, rctx, nullptr, &rmattr, y, &target);
 }
 
-int MotrObject::copy_obj_data(RGWObjectCtx& rctx, Bucket* dest_bucket,
-    Object* dest_obj,
-    uint16_t olh_epoch,
-    std::string* petag,
-    const DoutPrefixProvider* dpp,
-    optional_yield y)
-{
-  return 0;
-}
-
 /* RGWObjectCtx will be moved out of sal */
 /* XXX: Placeholder. Should not be needed later after Dan's patch */
 void MotrObject::set_atomic(RGWObjectCtx* rctx) const
@@ -953,7 +1005,7 @@ bool MotrObject::placement_rules_match(rgw_placement_rule& r1, rgw_placement_rul
   return true;
 }
 
-int MotrObject::get_obj_layout(const DoutPrefixProvider *dpp, optional_yield y, Formatter* f, RGWObjectCtx* obj_ctx)
+int MotrObject::dump_obj_layout(const DoutPrefixProvider *dpp, optional_yield y, Formatter* f, RGWObjectCtx* obj_ctx)
 {
   return 0;
 }
@@ -1492,8 +1544,7 @@ int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
   bool truncated = false;
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
 
-  upload = this->store->get_multipart_upload(this->get_bucket(), this->get_name(),
-                                             string(), ceph::real_time());
+  upload = this->get_bucket()->get_multipart_upload(this->get_name(), string());
 
   do {
     rc = upload->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
@@ -1552,8 +1603,7 @@ int MotrObject::open_part_objs(const DoutPrefixProvider* dpp,
 int MotrObject::delete_part_objs(const DoutPrefixProvider* dpp)
 {
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
-  upload = this->store->get_multipart_upload(this->get_bucket(), this->get_name(),
-                                             string(), ceph::real_time());
+  upload = this->get_bucket()->get_multipart_upload(this->get_name(), string());
   std::unique_ptr<rgw::sal::MotrMultipartUpload> mupload(static_cast<rgw::sal::MotrMultipartUpload *>(upload.release()));
   return mupload->delete_parts(dpp);
 }
@@ -1922,11 +1972,13 @@ struct motr_multipart_upload_info
 WRITE_CLASS_ENCODER(motr_multipart_upload_info)
 
 int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y,
-                              RGWObjectCtx* obj_ctx, ACLOwner& owner,
+                              RGWObjectCtx* obj_ctx, ACLOwner& _owner,
 			      rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs)
 {
   int rc;
   std::string oid = mp_obj.get_key();
+
+  owner = _owner;
 
   do {
     char buf[33];
@@ -2446,8 +2498,11 @@ int MotrStore::get_oidc_providers(const DoutPrefixProvider *dpp,
   return 0;
 }
 
-std::unique_ptr<MultipartUpload> MotrStore::get_multipart_upload(Bucket* bucket, const std::string& oid, std::optional<std::string> upload_id, ceph::real_time mtime) {
-  return std::make_unique<MotrMultipartUpload>(this, bucket, oid, upload_id, mtime);
+std::unique_ptr<MultipartUpload> MotrBucket::get_multipart_upload(const std::string& oid,
+                                std::optional<std::string> upload_id,
+                                ACLOwner owner, ceph::real_time mtime)
+{
+  return std::make_unique<MotrMultipartUpload>(store, this, oid, upload_id, owner, mtime);
 }
 
 std::unique_ptr<Writer> MotrStore::get_append_writer(const DoutPrefixProvider *dpp,
@@ -2546,7 +2601,7 @@ int MotrStore::get_bucket(const DoutPrefixProvider *dpp, User* u, const rgw_buck
   Bucket* bp;
 
   bp = new MotrBucket(this, b, u);
-  ret = bp->get_bucket_info(dpp, y);
+  ret = bp->load_bucket(dpp, y);
   if (ret < 0) {
     delete bp;
     return ret;
@@ -2577,91 +2632,6 @@ int MotrStore::get_bucket(const DoutPrefixProvider *dpp, User* u, const std::str
   return get_bucket(dpp, u, b, bucket, y);
 }
 
-int MotrStore::create_bucket(const DoutPrefixProvider *dpp,
-    User* u, const rgw_bucket& b,
-    const string& zonegroup_id,
-    rgw_placement_rule& placement_rule,
-    string& swift_ver_location,
-    const RGWQuotaInfo * pquota_info,
-    const RGWAccessControlPolicy& policy,
-    Attrs& attrs,
-    RGWBucketInfo& info,
-    obj_version& ep_objv,
-    bool exclusive,
-    bool obj_lock_enabled,
-    bool *existed,
-    req_info& req_info,
-    std::unique_ptr<Bucket>* bucket_out,
-    optional_yield y)
-{
-  int ret;
-  std::unique_ptr<Bucket> bucket;
-
-  // Look up the bucket. Create it if it doesn't exist.
-  ret = get_bucket(dpp, u, b, &bucket, y);
-  if (ret < 0 && ret != -ENOENT)
-    return ret;
-
-  if (ret != -ENOENT) {
-    *existed = true;
-    if (swift_ver_location.empty()) {
-      swift_ver_location = bucket->get_info().swift_ver_location;
-    }
-    placement_rule.inherit_from(bucket->get_info().placement_rule);
-
-    // TODO: ACL policy
-    // // don't allow changes to the acl policy
-    //RGWAccessControlPolicy old_policy(ctx());
-    //int rc = rgw_op_get_bucket_policy_from_attr(
-    //           dpp, this, u, bucket->get_attrs(), &old_policy, y);
-    //if (rc >= 0 && old_policy != policy) {
-    //    bucket_out->swap(bucket);
-    //    return -EEXIST;
-    //}
-  } else {
-    placement_rule.name = "default";
-    placement_rule.storage_class = "STANDARD";
-    bucket = std::make_unique<MotrBucket>(this, b, u);
-    bucket->set_attrs(attrs);
-
-    *existed = false;
-  }
-
-  // TODO: how to handle zone and multi-site.
-
-  if (!*existed) {
-    info.placement_rule = placement_rule;
-    info.bucket = b;
-    info.owner = u->get_info().user_id;
-    info.zonegroup = zonegroup_id;
-    if (obj_lock_enabled)
-      info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
-    bucket->set_version(ep_objv);
-    bucket->get_info() = info;
-
-    // Create a new bucket: (1) Add a key/value pair in the
-    // bucket instance index. (2) Create a new bucket index.
-    MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
-    ret = mbucket->put_info(dpp, y, ceph::real_time())? :
-          mbucket->create_bucket_index() ? :
-          mbucket->create_multipart_indices();
-    if (ret < 0)
-      ldout(cctx, 0) << "ERROR: failed to create bucket indices! " << ret << dendl;
-
-     // Insert the bucket entry into the user info index.
-     ret = mbucket->link_user(dpp, u, y);
-     if (ret < 0)
-        ldout(cctx, 0) << "ERROR: failed to add bucket entry! " << ret << dendl;
-  } else {
-    bucket->set_version(ep_objv);
-    bucket->get_info() = info;
-  }
-
-  bucket_out->swap(bucket);
-
-  return ret;
-}
-
 bool MotrStore::is_meta_master()
 {
   return true;
@@ -2671,11 +2641,6 @@ int MotrStore::forward_request_to_master(const DoutPrefixProvider *dpp, User* us
     bufferlist& in_data,
     JSONParser *jp, req_info& info,
     optional_yield y)
-{
-  return 0;
-}
-
-int MotrStore::defer_gc(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx, Bucket* bucket, Object* obj, optional_yield y)
 {
   return 0;
 }
@@ -2750,10 +2715,10 @@ int MotrStore::set_buckets_enabled(const DoutPrefixProvider *dpp, vector<rgw_buc
 //
 //      RGWBucketInfo info;
 //      map<string, bufferlist> attrs;
-//      int r = getDB()->get_bucket_info(dpp, string("name"), "", info, &attrs,
+//      int r = getDB()->load_bucket(dpp, string("name"), "", info, &attrs,
 //          nullptr, nullptr);
 //      if (r < 0) {
-//        ldpp_dout(dpp, 0) << "NOTICE: get_bucket_info on bucket=" << bucket.name << " returned err=" << r << ", skipping bucket" << dendl;
+//        ldpp_dout(dpp, 0) << "NOTICE: load_bucket on bucket=" << bucket.name << " returned err=" << r << ", skipping bucket" << dendl;
 //        ret = r;
 //        continue;
 //      }

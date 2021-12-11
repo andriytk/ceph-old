@@ -106,7 +106,22 @@ class MotrUser : public User {
     }
     int list_buckets(const DoutPrefixProvider *dpp, const string& marker, const string& end_marker,
         uint64_t max, bool need_stats, BucketList& buckets, optional_yield y) override;
-    virtual Bucket* create_bucket(rgw_bucket& bucket, ceph::real_time creation_time) override;
+    virtual int create_bucket(const DoutPrefixProvider* dpp,
+                            const rgw_bucket& b,
+                            const std::string& zonegroup_id,
+                            rgw_placement_rule& placement_rule,
+                            std::string& swift_ver_location,
+                            const RGWQuotaInfo* pquota_info,
+                            const RGWAccessControlPolicy& policy,
+                            Attrs& attrs,
+                            RGWBucketInfo& info,
+                            obj_version& ep_objv,
+                            bool exclusive,
+                            bool obj_lock_enabled,
+                            bool* existed,
+                            req_info& req_info,
+                            std::unique_ptr<Bucket>* bucket,
+                            optional_yield y) override;
     virtual int read_attrs(const DoutPrefixProvider* dpp, optional_yield y) override;
     virtual int read_stats(const DoutPrefixProvider *dpp,
         optional_yield y, RGWStorageStats* stats,
@@ -224,31 +239,29 @@ class MotrBucket : public Bucket {
 
     virtual std::unique_ptr<Object> get_object(const rgw_obj_key& k) override;
     virtual int list(const DoutPrefixProvider *dpp, ListParams&, int, ListResults&, optional_yield y) override;
-    virtual int remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, string prefix, string delimiter, bool forward_to_master, req_info* req_info, optional_yield y) override;
+    virtual int remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y) override;
     virtual int remove_bucket_bypass_gc(int concurrent_max, bool
         keep_index_consistent,
         optional_yield y, const
         DoutPrefixProvider *dpp) override;
     virtual RGWAccessControlPolicy& get_acl(void) override { return acls; }
     virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
-    virtual int get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y) override;
+    virtual int load_bucket(const DoutPrefixProvider *dpp, optional_yield y) override;
     int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
     int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
     int create_bucket_index();
     int create_multipart_indices();
-    virtual int get_bucket_stats(const DoutPrefixProvider *dpp, int shard_id,
+    virtual int read_stats(const DoutPrefixProvider *dpp, int shard_id,
         string *bucket_ver, string *master_ver,
         map<RGWObjCategory, RGWStorageStats>& stats,
         string *max_marker = nullptr,
         bool *syncstopped = nullptr) override;
-    virtual int get_bucket_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB* ctx) override;
-    virtual int read_bucket_stats(const DoutPrefixProvider *dpp, optional_yield y) override;
+    virtual int read_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB* ctx) override;
     virtual int sync_user_stats(const DoutPrefixProvider *dpp, optional_yield y) override;
     virtual int update_container_stats(const DoutPrefixProvider *dpp) override;
     virtual int check_bucket_shards(const DoutPrefixProvider *dpp) override;
     virtual int chown(const DoutPrefixProvider *dpp, User* new_user, User* old_user, optional_yield y, const string* marker = nullptr) override;
     virtual int put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::real_time mtime) override;
-    virtual int remove_metadata(const DoutPrefixProvider* dpp, RGWObjVersionTracker* objv, optional_yield y) override;
     virtual bool is_owner(User* user) override;
     virtual int check_empty(const DoutPrefixProvider *dpp, optional_yield y) override;
     virtual int check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size, optional_yield y, bool check_size_only = false) override;
@@ -266,6 +279,9 @@ class MotrBucket : public Bucket {
     virtual std::unique_ptr<Bucket> clone() override {
       return std::make_unique<MotrBucket>(*this);
     }
+    virtual std::unique_ptr<MultipartUpload> get_multipart_upload(const std::string& oid,
+                                std::optional<std::string> upload_id=std::nullopt,
+                                ACLOwner owner={}, ceph::real_time mtime=real_clock::now()) override;
     virtual int list_multiparts(const DoutPrefixProvider *dpp,
       const string& prefix,
       string& marker,
@@ -274,9 +290,7 @@ class MotrBucket : public Bucket {
       vector<std::unique_ptr<MultipartUpload>>& uploads,
       map<string, bool> *common_prefixes,
       bool *is_truncated) override;
-    virtual int abort_multiparts(const DoutPrefixProvider *dpp,
-       CephContext *cct,
-       string& prefix, string& delim) override;
+    virtual int abort_multiparts(const DoutPrefixProvider *dpp, CephContext *cct) override;
 
     friend class MotrStore;
 };
@@ -448,7 +462,6 @@ class MotrObject : public Object {
     virtual int get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj = NULL) override;
     virtual int modify_obj_attrs(RGWObjectCtx* rctx, const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp) override;
     virtual int delete_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, const char* attr_name, optional_yield y) override;
-    virtual int copy_obj_data(RGWObjectCtx& rctx, Bucket* dest_bucket, Object* dest_obj, uint16_t olh_epoch, string* petag, const DoutPrefixProvider* dpp, optional_yield y) override;
     virtual bool is_expired() override;
     virtual void gen_rand_obj_instance_name() override;
     virtual std::unique_ptr<Object> clone() override {
@@ -463,7 +476,7 @@ class MotrObject : public Object {
         const DoutPrefixProvider* dpp,
         optional_yield y) override;
     virtual bool placement_rules_match(rgw_placement_rule& r1, rgw_placement_rule& r2) override;
-    virtual int get_obj_layout(const DoutPrefixProvider *dpp, optional_yield y, Formatter* f, RGWObjectCtx* obj_ctx) override;
+    virtual int dump_obj_layout(const DoutPrefixProvider *dpp, optional_yield y, Formatter* f, RGWObjectCtx* obj_ctx) override;
 
     /* Swift versioning */
     virtual int swift_versioning_restore(RGWObjectCtx* obj_ctx,
@@ -664,17 +677,21 @@ public:
 class MotrMultipartUpload : public MultipartUpload {
   MotrStore* store;
   RGWMPObj mp_obj;
+  ACLOwner owner;
   ceph::real_time mtime;
   rgw_placement_rule placement;
   RGWObjManifest manifest;
 
 public:
-  MotrMultipartUpload(MotrStore* _store, Bucket* _bucket, const std::string& oid, std::optional<std::string> upload_id, ceph::real_time _mtime) : MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), mtime(_mtime) {}
+  MotrMultipartUpload(MotrStore* _store, Bucket* _bucket, const std::string& oid,
+                      std::optional<std::string> upload_id, ACLOwner _owner, ceph::real_time _mtime) :
+       MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {}
   virtual ~MotrMultipartUpload() = default;
 
   virtual const std::string& get_meta() const { return mp_obj.get_meta(); }
   virtual const std::string& get_key() const { return mp_obj.get_key(); }
   virtual const std::string& get_upload_id() const { return mp_obj.get_upload_id(); }
+  virtual const ACLOwner& get_owner() const override { return owner; }
   virtual ceph::real_time& get_mtime() { return mtime; }
   virtual std::unique_ptr<rgw::sal::Object> get_meta_obj() override;
   virtual int init(const DoutPrefixProvider* dpp, optional_yield y, RGWObjectCtx* obj_ctx, ACLOwner& owner, rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs) override;
@@ -730,27 +747,9 @@ class MotrStore : public Store {
     virtual int get_bucket(const DoutPrefixProvider *dpp, User* u, const rgw_bucket& b, std::unique_ptr<Bucket>* bucket, optional_yield y) override;
     virtual int get_bucket(User* u, const RGWBucketInfo& i, std::unique_ptr<Bucket>* bucket) override;
     virtual int get_bucket(const DoutPrefixProvider *dpp, User* u, const string& tenant, const string&name, std::unique_ptr<Bucket>* bucket, optional_yield y) override;
-    virtual int create_bucket(const DoutPrefixProvider* dpp,
-        User* u, const rgw_bucket& b,
-        const string& zonegroup_id,
-        rgw_placement_rule& placement_rule,
-        string& swift_ver_location,
-        const RGWQuotaInfo* pquota_info,
-        const RGWAccessControlPolicy& policy,
-        Attrs& attrs,
-        RGWBucketInfo& info,
-        obj_version& ep_objv,
-        bool exclusive,
-        bool obj_lock_enabled,
-        bool* existed,
-        req_info& req_info,
-        std::unique_ptr<Bucket>* bucket,
-        optional_yield y) override;
     virtual bool is_meta_master() override;
     virtual int forward_request_to_master(const DoutPrefixProvider *dpp, User* user, obj_version* objv,
         bufferlist& in_data, JSONParser *jp, req_info& info,
-        optional_yield y) override;
-    virtual int defer_gc(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx, Bucket* bucket, Object* obj,
         optional_yield y) override;
     virtual Zone* get_zone() { return &zone; }
     virtual string zone_unique_id(uint64_t unique_num) override;
@@ -811,7 +810,6 @@ class MotrStore : public Store {
     virtual int get_oidc_providers(const DoutPrefixProvider *dpp,
         const string& tenant,
         vector<std::unique_ptr<RGWOIDCProvider>>& providers) override;
-    virtual std::unique_ptr<MultipartUpload> get_multipart_upload(Bucket* bucket, const std::string& oid, std::optional<std::string> upload_id=std::nullopt, ceph::real_time mtime=real_clock::now()) override;
     virtual std::unique_ptr<Writer> get_append_writer(const DoutPrefixProvider *dpp,
         optional_yield y,
         std::unique_ptr<rgw::sal::Object> _head_obj,
