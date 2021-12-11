@@ -3194,13 +3194,22 @@ void *newMotrStore(CephContext *cct)
     const auto& proc_ep  = g_conf().get_val<std::string>("my_motr_endpoint");
     const auto& ha_ep    = g_conf().get_val<std::string>("motr_ha_endpoint");
     const auto& proc_fid = g_conf().get_val<std::string>("my_motr_fid");
+    const auto& other_proc_fid = g_conf().get_val<std::string>("my_other_motr_fid");
     const auto& profile  = g_conf().get_val<std::string>("motr_profile_fid");
+    const int init_flags = cct->get_init_flags();
+    ldout(cct, 0) << "INFO: init flags:        " << init_flags << dendl;
     ldout(cct, 0) << "INFO: my motr endpoint:  " << proc_ep << dendl;
     ldout(cct, 0) << "INFO: ha agent endpoint: " << ha_ep << dendl;
     ldout(cct, 0) << "INFO: my motr fid:       " << proc_fid << dendl;
+    ldout(cct, 0) << "INFO: my other motr fid: " << other_proc_fid << dendl;
     ldout(cct, 0) << "INFO: motr profile fid:  " << profile << dendl;
     store->conf.mc_local_addr  = proc_ep.c_str();
-    store->conf.mc_process_fid = proc_fid.c_str();
+    // HACK this is so that radosge-admin uses a different client
+    if (init_flags == 0) {
+      store->conf.mc_process_fid = other_proc_fid.c_str();
+    } else {
+      store->conf.mc_process_fid = proc_fid.c_str();
+    }
     store->conf.mc_ha_addr     = ha_ep.c_str();
     store->conf.mc_profile     = profile.c_str();
     store->conf.mc_tm_recv_queue_min_len =     64;

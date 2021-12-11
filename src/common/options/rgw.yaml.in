@@ -3261,6 +3261,14 @@ options:
   default: 0x7200000000000001:0x0
   services:
   - rgw
+- name: my_other_motr_fid
+  type: str
+  level: advanced
+  desc: experimental Option to set my Motr fid
+  long_desc: example value 0x7200000000000001:0x29
+  default: 0x7200000000000001:0x0
+  services:
+  - rgw
 - name: my_motr_endpoint
   type: str
   level: advanced
