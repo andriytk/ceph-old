@@ -1967,6 +1967,19 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   if (is_versioned) {
     // get the list of all versioned objects with the same key and
     // unset their FLAG_CURRENT later, if do_idx_op_by_name() is successful.
+    // Note: without distributed lock on the index - it is possible that 2
+    // CURRENT entries would appear in the bucket. For example, consider the
+    // following scenario when two clients are trying to add the new object
+    // version concurrently:
+    //   client 1: reads all the CURRENT entries
+    //   client 2: updates the index and sets the new CURRENT
+    //   client 1: updates the index and sets the new CURRENT
+    // At the step (1) client 1 would not see the new current record from step (2),
+    // so it won't update it. As a result, two CURRENT version entries will appear
+    // in the bucket.
+    // TODO: update the current version (unset the flag) and insert the new current
+    // version can be launched in one motr op. This requires change at do_idx_op()
+    // and do_idx_op_by_name().
     int rc = obj.update_version_entries(dpp);
     if (rc < 0)
       return rc;
@@ -3051,13 +3064,10 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
   }
 
 out:
-  if (i == 0) {
-    m0_bufvec_free2(&k);
-    m0_bufvec_free2(&v);
-  } else {
-    m0_bufvec_free(&k);
-    m0_bufvec_free(&v); // cleanup buffer after GET
-  }
+  k.ov_vec.v_nr = i;
+  v.ov_vec.v_nr = i;
+  m0_bufvec_free(&k);
+  m0_bufvec_free(&v); // cleanup buffer after GET
 
   delete []rcs;
   return rc ?: i;
