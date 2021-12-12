@@ -1025,21 +1025,10 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   int rc;
   ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): enter, bucket =  " << source->get_bucket()->get_name() << dendl;
 
-  // Get object's metadata (those stored in rgw_bucket_dir_entry).
-  bufferlist bl;
-  string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
-  rc = source->store->do_idx_op_by_name(bucket_index_iname,
-                                M0_IC_GET, source->get_key().to_str(), bl);
-  ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): query bucket index "<< bucket_index_iname << dendl;
-  if (rc < 0) {
-    ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index." << dendl;
-    return rc;
-  }
-
   rgw_bucket_dir_entry ent;
-  bufferlist& blr = bl;
-  auto iter = blr.cbegin();
-  ent.decode(iter);
+  rc = source->get_bucket_dir_ent(dpp, ent);
+  if (rc < 0)
+    return rc;
 
   // Set source object's attrs. The attrs is key/value map and is used
   // in send_response_data() to set attributes, including etag.
@@ -1529,6 +1518,115 @@ out:
   return rc;
 }
 
+int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir_entry& ent)
+{
+  int rc;
+  string bucket_index_iname = "motr.rgw.bucket.index." + this->get_bucket()->get_name();
+
+  if (this->get_bucket()->get_info().versioning_status() == BUCKET_VERSIONED ||
+      this->get_bucket()->get_info().versioning_status() == BUCKET_SUSPENDED) {
+    
+    ldpp_dout(dpp, 0) << "versioned bucket!" << dendl;
+    int max = 1000;
+    vector<string> keys(max);
+    vector<bufferlist> vals(max);
+    keys[0] = this->get_name();
+    ldpp_dout(dpp, 0) << "get all versions (max == 1000)" << dendl;
+    rc = store->next_query_by_name(bucket_index_iname, keys, vals);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      return rc;
+    }
+
+    bool found = false; 
+    for (const auto& bl: vals) {
+      if (bl.length() == 0)
+        break;
+
+      rgw_bucket_dir_entry ent_to_check;
+      auto iter = bl.cbegin();
+      ent_to_check.decode(iter);
+      if (ent_to_check.is_current()) {
+        ldpp_dout(dpp, 0) << "found current version!" << dendl;
+        found = true;
+        ent = ent_to_check;
+	break;
+      }
+    }
+    if (found)
+      return 0;
+    else 
+      return -ENOENT;
+  } else {
+    bufferlist bl;
+    ldpp_dout(dpp, 0) << "non-versioned bucket!" << dendl;
+    rc = this->store->do_idx_op_by_name(bucket_index_iname,
+                                        M0_IC_GET, this->get_key().to_str(), bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index." << dendl;
+      return rc;
+    }
+    bufferlist& blr = bl;
+    auto iter = blr.cbegin();
+    ent.decode(iter);
+    return 0;
+  }
+}
+
+int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
+{
+  int rc;
+  int max = 10;
+  vector<string> keys(max);
+  vector<bufferlist> vals(max);
+
+  string bucket_index_iname = "motr.rgw.bucket.index." + this->get_bucket()->get_name();
+  keys[0] = this->get_name();
+  rc = store->next_query_by_name(bucket_index_iname, keys, vals);
+  ldpp_dout(dpp, 0) << "get all versions, name = " << this->get_name() << "rc = " << rc << dendl;
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+    return rc;
+  }
+
+  // no entries returned.
+  if (rc == 0)
+    return 0;
+
+  for (const auto& bl: vals) {
+    if (bl.length() == 0)
+      break;
+
+    rgw_bucket_dir_entry ent;
+    auto iter = bl.cbegin();
+    ent.decode(iter);
+
+    if (0 != ent.key.name.compare(0, this->get_name().size(), this->get_name()))
+      continue;
+
+    if (!ent.is_current())
+      continue;
+
+    ent.flags = rgw_bucket_dir_entry::FLAG_VER;
+    string key;
+    if (ent.key.instance.empty())
+      key = ent.key.name;
+    else {
+      char buf[ent.key.name.size() + ent.key.instance.size() + 16];
+      snprintf(buf, sizeof(buf), "%s[%s]", ent.key.name.c_str(), ent.key.instance.c_str());
+      key = buf; 
+    }
+    ldpp_dout(dpp, 0) << "update one version, key = " << key << dendl;
+    bufferlist ent_bl;
+    ent.encode(ent_bl);
+    rc = store->do_idx_op_by_name(bucket_index_iname,
+                                  M0_IC_PUT, key, ent_bl);
+    if (rc < 0)
+      break;
+  }
+  return rc;
+}
+
 // Scan object_nnn_part_index to get all parts then open their motr objects.
 // TODO: all parts are opened in the POC. But for a large object, for example
 // a 5GB object will have about 300 parts (for default 15MB part). A better
@@ -1859,17 +1957,32 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
       real_time lock_until_date = info.obj_lock.get_lock_until_date(ent.meta.mtime);
       string mode = info.obj_lock.get_mode();
       RGWObjectRetention obj_retention(mode, lock_until_date);
-      bufferlist bl;
-      obj_retention.encode(bl);
-      attrs[RGW_ATTR_OBJECT_RETENTION] = bl;
+      bufferlist retention_bl;
+      obj_retention.encode(retention_bl);
+      attrs[RGW_ATTR_OBJECT_RETENTION] = retention_bl;
     }
   }
-
   encode(attrs, bl);
 
   if (is_versioned) {
     // get the list of all versioned objects with the same key and
     // unset their FLAG_CURRENT later, if do_idx_op_by_name() is successful.
+    // Note: without distributed lock on the index - it is possible that 2
+    // CURRENT entries would appear in the bucket. For example, consider the
+    // following scenario when two clients are trying to add the new object
+    // version concurrently:
+    //   client 1: reads all the CURRENT entries
+    //   client 2: updates the index and sets the new CURRENT
+    //   client 1: updates the index and sets the new CURRENT
+    // At the step (1) client 1 would not see the new current record from step (2),
+    // so it won't update it. As a result, two CURRENT version entries will appear
+    // in the bucket.
+    // TODO: update the current version (unset the flag) and insert the new current
+    // version can be launched in one motr op. This requires change at do_idx_op()
+    // and do_idx_op_by_name().
+    int rc = obj.update_version_entries(dpp);
+    if (rc < 0)
+      return rc;
   }
   // Insert an entry into bucket index.
   string bucket_index_iname = "motr.rgw.bucket.index." + obj.get_bucket()->get_name();
@@ -2852,7 +2965,7 @@ int MotrStore::do_idx_op(struct m0_idx *idx, enum m0_idx_opcode opcode,
 
   set_m0bufvec(&k, key);
   ldout(cctx, 0) << "bv->ov_buf[0] = " << k.ov_buf[0] << dendl;
-  ldout(cctx, 0) << "bv->ov_vec.v_count[0]" << k.ov_buf[0] << dendl;
+  ldout(cctx, 0) << "bv->ov_vec.v_count[0]" << k.ov_vec.v_count[0] << dendl;
   if (opcode == M0_IC_PUT)
     set_m0bufvec(&v, val);
 
@@ -2951,8 +3064,10 @@ int MotrStore::do_idx_next_op(struct m0_idx *idx,
   }
 
 out:
+  k.ov_vec.v_nr = i;
+  v.ov_vec.v_nr = i;
   m0_bufvec_free(&k);
-  m0_bufvec_free(&v);
+  m0_bufvec_free(&v); // cleanup buffer after GET
 
   delete []rcs;
   return rc ?: i;
