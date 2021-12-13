@@ -1480,7 +1480,8 @@ int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t en
         actual = end - off;
     ldpp_dout(dpp, 20) << "MotrObject::read_mobj(): off=" << off <<
                                             " actual=" << actual << dendl;
-    buf.ov_buf[0] = new char[bs];
+    bufferlist bl;
+    buf.ov_buf[0] = bl.append_hole(bs).c_str();
     buf.ov_vec.v_count[0] = bs;
     ext.iv_index[0] = off;
     ext.iv_vec.v_count[0] = bs;
@@ -1501,14 +1502,8 @@ int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t en
       goto out;
 
     // Call `cb` to process returned data.
-    bufferlist bl;
-    bl.append(reinterpret_cast<char *>(buf.ov_buf[0]), actual);
     ldpp_dout(dpp, 20) << "MotrObject::read_mobj(): call cb to process data" << dendl;
     cb->handle_data(bl, off, actual);
-
-    // Free memory.
-    delete [](reinterpret_cast<char *>(buf.ov_buf[0]));
-    buf.ov_buf[0] = NULL;
   }
 
 out:
