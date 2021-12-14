@@ -3089,12 +3089,12 @@ int MotrStore::next_query_by_name(string idx_name,
 
   // Only the first element for keys needs to be set for NEXT query.
   // The keys will be set will the returned keys from motr index.
-  ldout(cctx, 0) << "DEBUG: next_query_by_name(): index=" << idx_name
-                 << " prefix=" << prefix << dendl;
+  ldout(cctx, 20) << "DEBUG: next_query_by_name(): index=" << idx_name
+                  << " prefix=" << prefix << " delim=" << delim << dendl;
   keys[0].assign(key_out[0].begin(), key_out[0].end());
   for (i = 0; i < (int)val_out.size(); i += k, k = 0) {
     rc = do_idx_next_op(&idx, keys, vals);
-    ldout(cctx, 0) << "do_idx_next_op() = " << rc << dendl;
+    ldout(cctx, 20) << "do_idx_next_op() = " << rc << dendl;
     if (rc < 0) {
       ldout(cctx, 0) << "ERROR: NEXT query failed. " << rc << dendl;
       goto out;
@@ -3103,7 +3103,9 @@ int MotrStore::next_query_by_name(string idx_name,
     string dir;
     for (j = 0, k = 0; j < rc; ++j) {
       string key(keys[j].begin(), keys[j].end());
-      size_t pos = key.find(delim, prefix.length());
+      size_t pos = std::string::npos;
+      if (!delim.empty())
+        pos = key.find(delim, prefix.length());
       if (pos && pos != std::string::npos) { // DIR entry
         dir.assign(key, 0, pos + 1);
         if (dir.compare(0, prefix.length(), prefix) != 0)
