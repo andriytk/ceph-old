@@ -3106,7 +3106,7 @@ int MotrStore::next_query_by_name(string idx_name,
       size_t pos = std::string::npos;
       if (!delim.empty())
         pos = key.find(delim, prefix.length());
-      if (pos && pos != std::string::npos) { // DIR entry
+      if (pos != std::string::npos) { // DIR entry
         dir.assign(key, 0, pos + 1);
         if (dir.compare(0, prefix.length(), prefix) != 0)
           goto out;
