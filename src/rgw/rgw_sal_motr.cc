@@ -3338,6 +3338,11 @@ void *newMotrStore(CephContext *cct)
       goto out;
     }
 
+    if (!g_conf().get_val<bool>("motr_tracing_enabled")) {
+      m0_trace_level_allow(M0_WARN); // allow errors and warnings in syslog anyway
+      m0_trace_set_mmapped_buffer(false);
+    }
+
   }
 
 out:
