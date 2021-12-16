@@ -3317,6 +3317,11 @@ void *newMotrStore(CephContext *cct)
     store->dix_conf.kc_create_meta = false;
     store->conf.mc_idx_service_conf = &store->dix_conf;
 
+    if (!g_conf().get_val<bool>("motr_tracing_enabled")) {
+      m0_trace_level_allow(M0_WARN); // allow errors and warnings in syslog anyway
+      m0_trace_set_mmapped_buffer(false);
+    }
+
     store->instance = NULL;
     rc = m0_client_init(&store->instance, &store->conf, true);
     if (rc != 0) {
@@ -3336,11 +3341,6 @@ void *newMotrStore(CephContext *cct)
     if (rc != 0) {
       ldout(cct, 0) << "ERROR: check_n_create_global_indices() failed: " << rc << dendl;
       goto out;
-    }
-
-    if (!g_conf().get_val<bool>("motr_tracing_enabled")) {
-      m0_trace_level_allow(M0_WARN); // allow errors and warnings in syslog anyway
-      m0_trace_set_mmapped_buffer(false);
     }
 
   }
