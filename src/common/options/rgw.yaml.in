@@ -3277,6 +3277,13 @@ options:
   default: 192.168.180.182@tcp:12345:1:1
   services:
   - rgw
+- name: motr_tracing_enabled
+  type: bool
+  level: advanced
+  desc: Set to true when Motr client debugging is needed
+  default: false
+  services:
+  - rgw
 - name: rgw_luarocks_location
   type: str
   level: advanced
