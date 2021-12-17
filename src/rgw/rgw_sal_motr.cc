@@ -1271,7 +1271,10 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
 
   this->obj_name_to_motr_fid(&fid);
 
-  ldpp_dout(dpp, 20) << "create_mobj(): sz = " << sz << dendl;
+  char fid_str[40];
+  snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&fid));
+  ldpp_dout(dpp, 20) << __func__ << ": sz=" << sz << " fid=" << fid_str << dendl;
+
   int64_t lid = m0_layout_find_by_objsz(store->instance, NULL, sz);
   M0_ASSERT(lid > 0);
 
@@ -1280,14 +1283,13 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   m0_obj_init(mobj, &store->container.co_realm, &fid, lid);
 
   struct m0_op *op = NULL;
-  ldpp_dout(dpp, 20) << "create_mobj(): m0_entity_create() " << dendl;
   int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
   if (rc != 0) {
     this->close_mobj();
     ldpp_dout(dpp, 0) << "ERROR: m0_entity_create() failed: " << rc << dendl;
     return rc;
   }
-  ldpp_dout(dpp, 20) << "create_mobj(): m0_op_launch() " << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": call m0_op_launch()..." << dendl;
   m0_op_launch(&op, 1);
   rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
        m0_rc(op);
@@ -1301,13 +1303,18 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   }
 
   layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
-  ldpp_dout(dpp, 20) << "create_mobj(): rc =  " << rc << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": rc=" << rc << dendl;
+
   return rc;
 }
 
 int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
 {
   this->obj_name_to_motr_fid(&fid);
+
+  char fid_str[40];
+  snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&fid));
+  ldpp_dout(dpp, 20) << __func__ << ": fid=" << fid_str << dendl;
 
   M0_ASSERT(mobj == NULL);
   mobj = new (struct m0_obj);
@@ -1334,6 +1341,8 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   }
 
   layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
+  ldpp_dout(dpp, 20) << __func__ << ": rc=" << rc << dendl;
+
   return 0;
 }
 
