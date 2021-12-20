@@ -4,7 +4,9 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2021 Red Hat, Inc.
+ * SAL implementation for the CORTX Motr backend
+ *
+ * Copyright (C) 2021 Seagate Technology LLC and/or its Affiliates
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

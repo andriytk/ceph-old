@@ -125,7 +125,7 @@ public:
  *
  * Data within RGW is stored as an Object.  Each Object is a single chunk of data, owned
  * by a single User, contained within a single Bucket.  It has metadata associated with
- * it, such as size, owner, and so in, and a set of key-value attributes that can
+ * it, such as size, owner, and so on, and a set of key-value attributes that can
  * contain anything needed by the top half.
  *
  * Data with RGW is organized into Buckets.  Each Bucket is owned by a User, and
