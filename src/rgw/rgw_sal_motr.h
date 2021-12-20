@@ -378,6 +378,14 @@ class MotrObject : public Object {
 
     RGWObjCategory category;
 
+    // If this object is pat of a multipart uploaded one.
+    // TODO: do it in another class? MotrPartObject : public MotrObject
+    uint64_t part_off;
+    uint64_t part_size;
+    uint64_t part_num;
+
+  public:
+
     // motr object metadata stored in index
     struct Meta {
       struct m0_fid pver = {};
@@ -401,14 +409,6 @@ class MotrObject : public Object {
         DECODE_FINISH(bl);
       }
     };
-
-    // If this object is pat of a multipart uploaded one.
-    // TODO: do it in another class? MotrPartObject : public MotrObject
-    uint64_t part_off;
-    uint64_t part_size;
-    uint64_t part_num;
-
-  public:
 
     struct m0_obj     *mobj = NULL;
     struct m0_uint128  fid;
@@ -662,7 +662,7 @@ public:
 // related metadata: (1) Bucket multipart index (bucket_nnn_multipart_index)
 // which contains metadata that answers questions such as which objects have
 // started  multipart upload and its upload id. This index is created during
-// bucket creation. (2) Bbject part index (object_nnn_part_index) which stores
+// bucket creation. (2) Object part index (object_nnn_part_index) which stores
 // metadata of a part's details (size, pvid, oid...). This index is created in
 // MotrMultipartUpload::init(). (3) Extended metadata index
 // (bucket_nnn_extended_metadata): once parts has been uploaded and their
@@ -687,7 +687,10 @@ protected:
   RGWUploadPartInfo info;
 
 public:
-  MotrMultipartPart(RGWUploadPartInfo _info) : info(_info) {}
+  MotrObject::Meta  meta;
+
+  MotrMultipartPart(RGWUploadPartInfo _info, MotrObject::Meta _meta) :
+    info(_info), meta(_meta) {}
   virtual ~MotrMultipartPart() = default;
 
   virtual uint32_t get_num() { return info.num; }

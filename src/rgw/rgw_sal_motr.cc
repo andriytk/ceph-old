@@ -1622,6 +1622,11 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
     if (!ent.is_current())
       continue;
 
+    rgw::sal::Attrs attrs;
+    decode(attrs, iter);
+    MotrObject::Meta meta;
+    meta.decode(iter);
+
     ent.flags = rgw_bucket_dir_entry::FLAG_VER;
     string key;
     if (ent.key.instance.empty())
@@ -1634,6 +1639,9 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
     ldpp_dout(dpp, 20) << "update one version, key = " << key << dendl;
     bufferlist ent_bl;
     ent.encode(ent_bl);
+    encode(attrs, ent_bl);
+    meta.encode(ent_bl);
+
     rc = store->do_idx_op_by_name(bucket_index_iname,
                                   M0_IC_PUT, key, ent_bl);
     if (rc < 0)
@@ -1688,6 +1696,7 @@ int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
       mobj->part_off = off;
       mobj->part_size = part_size;
       mobj->part_num = part_num;
+      mobj->meta = mmpart->meta;
 
       part_objs.emplace(part_num, std::move(mobj));
 
@@ -2199,6 +2208,10 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     RGWUploadPartInfo info;
     auto iter = bl.cbegin();
     info.decode(iter);
+    rgw::sal::Attrs attrs_dummy;
+    decode(attrs_dummy, iter);
+    MotrObject::Meta meta;
+    meta.decode(iter);
 
     ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): part_num=" << info.num
                                              << " part_size=" << info.size << dendl;
@@ -2207,7 +2220,7 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
 
     if ((int)info.num > marker) {
       last_num = info.num;
-      parts.emplace(info.num, std::make_unique<MotrMultipartPart>(info));
+      parts.emplace(info.num, std::make_unique<MotrMultipartPart>(info, meta));
     }
 
     part_cnt++;
@@ -2418,6 +2431,10 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   ent.meta.mtime = ceph::real_clock::now();
   ent.meta.etag = etag;
   ent.encode(update_bl);
+  encode(attrs, update_bl);
+  MotrObject::Meta meta_dummy;
+  meta_dummy.encode(update_bl);
+
   string bucket_index_iname = "motr.rgw.bucket.index." + meta_obj->get_bucket()->get_name();
   ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): target_obj name=" << target_obj->get_name()
                                   << " target_obj oid=" << target_obj->get_oid() << dendl;
@@ -2569,6 +2586,8 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
     return rc;
   }
   encode(info, bl);
+  encode(attrs, bl);
+  part_obj->meta.encode(bl);
 
   string p = "part.";
   char buf[32];
