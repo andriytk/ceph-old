@@ -377,7 +377,30 @@ class MotrObject : public Object {
     RGWObjState *state;
 
     RGWObjCategory category;
-    uint64_t layout_id;
+
+    // motr object metadata stored in index
+    struct Meta {
+      struct m0_fid pver = {};
+      uint64_t layout_id = 0;
+
+      void encode(bufferlist& bl) const
+      {
+        ENCODE_START(3, 3, bl);
+        encode(pver.f_container, bl);
+        encode(pver.f_key, bl);
+        encode(layout_id, bl);
+        ENCODE_FINISH(bl);
+      }
+
+      void decode(bufferlist::const_iterator& bl)
+      {
+        DECODE_START(3, bl);
+        decode(pver.f_container, bl);
+        decode(pver.f_key, bl);
+        decode(layout_id, bl);
+        DECODE_FINISH(bl);
+      }
+    };
 
     // If this object is pat of a multipart uploaded one.
     // TODO: do it in another class? MotrPartObject : public MotrObject
@@ -387,8 +410,9 @@ class MotrObject : public Object {
 
   public:
 
-    struct m0_obj *mobj = NULL;
-    struct m0_uint128 fid;
+    struct m0_obj     *mobj = NULL;
+    struct m0_uint128  fid;
+    Meta               meta;
 
     struct MotrReadOp : public ReadOp {
       private:
