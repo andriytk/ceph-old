@@ -824,7 +824,7 @@ int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
   state->has_attrs = true;
   bufferlist etag_bl;
   string& etag = ent.meta.etag;
-  ldpp_dout(dpp, 20) << "object's etag:  " << ent.meta.etag << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": object's etag:  " << ent.meta.etag << dendl;
   etag_bl.append(etag);
   state->attrset[RGW_ATTR_ETAG] = etag_bl;
 
@@ -1026,7 +1026,7 @@ MotrObject::MotrReadOp::MotrReadOp(MotrObject *_source, RGWObjectCtx *_rctx) :
 int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* dpp)
 {
   int rc;
-  ldpp_dout(dpp, 20) << "MotrReadOp::prepare(): enter, bucket=" << source->get_bucket()->get_name() << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": bucket=" << source->get_bucket()->get_name() << dendl;
 
   rgw_bucket_dir_entry ent;
   rc = source->get_bucket_dir_ent(dpp, ent);
@@ -1037,7 +1037,7 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   // in send_response_data() to set attributes, including etag.
   bufferlist etag_bl;
   string& etag = ent.meta.etag;
-  ldpp_dout(dpp, 20) << "object's etag: " << ent.meta.etag << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": object's etag: " << ent.meta.etag << dendl;
   etag_bl.append(etag.c_str(), etag.size());
   source->get_attrs().emplace(std::move(RGW_ATTR_ETAG), std::move(etag_bl));
 
@@ -1046,14 +1046,15 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   source->category = ent.meta.category;
 
   // Open the object here.
-  ldpp_dout(dpp, 20) << "MotrReadOp::prepare(): open object. " << dendl;
   if (source->category == RGWObjCategory::MultiMeta) {
-    ldpp_dout(dpp, 0) << "MotrReadOp::prepare(): open part objects. " << dendl;
+    ldpp_dout(dpp, 20) << __func__ << ": open obj parts..." << dendl;
     rc = source->get_part_objs(dpp, this->part_objs)? :
          source->open_part_objs(dpp, this->part_objs);
     return rc;
-  } else
+  } else {
+    ldpp_dout(dpp, 20) << __func__ << ": open object..." << dendl;
     return source->open_mobj(dpp);
+  }
 }
 
 int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
@@ -1218,9 +1219,6 @@ MotrAtomicWriter::MotrAtomicWriter(const DoutPrefixProvider *dpp,
 
 static const unsigned MAX_BUFVEC_NR = 256;
 
-// Open existing object and allocate buffers.
-// If the object does not exist yet - no problem, we will create it
-// later at write(), after enough data is accumulated for it.
 int MotrAtomicWriter::prepare(optional_yield y)
 {
   total_data_size = 0;
@@ -1228,20 +1226,9 @@ int MotrAtomicWriter::prepare(optional_yield y)
   if (obj.is_opened())
     return 0;
 
-  int rc = obj.open_mobj(dpp);
-  if (rc != 0 && rc != -ENOENT) {
-    char fid_str[40];
-    snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&obj.fid));
-    ldpp_dout(dpp, 20) << "failed to open motr object "
-      << fid_str << " (" << obj.get_bucket()->get_name()
-      << "/" << obj.get_key().to_str() << "): rc=" << rc
-      << dendl;
-    return rc;
-  }
-
-  rc = m0_bufvec_empty_alloc(&buf, MAX_BUFVEC_NR) ?:
-    m0_bufvec_alloc(&attr, MAX_BUFVEC_NR, 1) ?:
-    m0_indexvec_alloc(&ext, MAX_BUFVEC_NR);
+  int rc = m0_bufvec_empty_alloc(&buf, MAX_BUFVEC_NR) ?:
+           m0_bufvec_alloc(&attr, MAX_BUFVEC_NR, 1) ?:
+           m0_indexvec_alloc(&ext, MAX_BUFVEC_NR);
   if (rc != 0)
     this->cleanup();
 
@@ -1285,6 +1272,7 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   m0_obj_init(mobj, &store->container.co_realm, &fid, lid);
 
   struct m0_op *op = NULL;
+  mobj->ob_entity.en_flags |= M0_ENF_META;
   int rc = m0_entity_create(NULL, &mobj->ob_entity, &op);
   if (rc != 0) {
     this->close_mobj();
@@ -1304,8 +1292,10 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
     return rc;
   }
 
-  layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
-  ldpp_dout(dpp, 20) << __func__ << ": rc=" << rc << dendl;
+  meta.layout_id = mobj->ob_attr.oa_layout_id;
+  meta.pver      = mobj->ob_attr.oa_pver;
+  ldpp_dout(dpp, 20) << __func__ << ": lid=0x" << std::hex << meta.layout_id
+                     << std::dec << " rc=" << rc << dendl;
 
   return rc;
 }
@@ -1318,16 +1308,30 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&fid));
   ldpp_dout(dpp, 20) << __func__ << ": fid=" << fid_str << dendl;
 
+  int rc;
+  if (meta.layout_id == 0) {
+    rgw_bucket_dir_entry ent;
+    rc = this->get_bucket_dir_ent(dpp, ent);
+    if (rc < 0)
+      return rc;
+  }
+
+  if (meta.layout_id == 0)
+    return -ENOENT;
+
   M0_ASSERT(mobj == NULL);
   mobj = new (struct m0_obj);
   memset(mobj, 0, sizeof *mobj);
   m0_obj_init(mobj, &store->container.co_realm, &fid, store->conf.mc_layout_id);
 
   struct m0_op *op = NULL;
-  int rc = m0_entity_open(&mobj->ob_entity, &op);
+  mobj->ob_attr.oa_layout_id = meta.layout_id;
+  mobj->ob_attr.oa_pver      = meta.pver;
+  mobj->ob_entity.en_flags  |= M0_ENF_META;
+  rc = m0_entity_open(&mobj->ob_entity, &op);
   if (rc != 0) {
+    ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: rc=" << rc << dendl;
     this->close_mobj();
-    ldpp_dout(dpp, 0) << "ERROR: m0_entity_open() failed: " << rc << dendl;
     return rc;
   }
   m0_op_launch(&op, 1);
@@ -1337,12 +1341,11 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   m0_op_free(op);
 
   if (rc < 0) {
+    ldpp_dout(dpp, 10) << "ERROR: failed to open motr object: rc=" << rc << dendl;
     this->close_mobj();
-    ldpp_dout(dpp, 10) << "ERROR: failed to open motr object: " << rc << dendl;
     return rc;
   }
 
-  layout_id = M0_OBJ_LAYOUT_ID(mobj->ob_attr.oa_layout_id);
   ldpp_dout(dpp, 20) << __func__ << ": rc=" << rc << dendl;
 
   return 0;
@@ -1361,7 +1364,8 @@ int MotrObject::delete_mobj(const DoutPrefixProvider *dpp)
 
   // Create an DELETE op and execute it (sync version).
   struct m0_op *op = NULL;
-  rc = m0_entity_delete( &mobj->ob_entity, &op);
+  mobj->ob_entity.en_flags |= M0_ENF_META;
+  rc = m0_entity_delete(&mobj->ob_entity, &op);
   if (rc != 0) {
     ldpp_dout(dpp, 0) << "ERROR: m0_entity_delete() failed: " << rc << dendl;
     return rc;
@@ -1377,9 +1381,8 @@ int MotrObject::delete_mobj(const DoutPrefixProvider *dpp)
     return rc;
   }
 
-  // Clean up.
   this->close_mobj();
-  layout_id = 0;
+
   return 0;
 }
 
@@ -1397,7 +1400,6 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
   unsigned bs, left;
   struct m0_op *op;
   char *start, *p;
-  bufferlist tail;
   struct m0_bufvec buf;
   struct m0_bufvec attr;
   struct m0_indexvec ext;
@@ -1423,8 +1425,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
     if (left < bs) {
       data.append_zero(bs - left);
       left = bs;
-      data.splice(p - start, bs, &tail);
-      p = tail.c_str();
+      p = data.c_str();
     }
     buf.ov_buf[0] = p;
     buf.ov_vec.v_count[0] = bs;
@@ -1522,6 +1523,7 @@ out:
   m0_bufvec_free(&attr);
   m0_bufvec_free2(&buf);
   this->close_mobj();
+
   return rc;
 }
 
@@ -1529,55 +1531,61 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
 {
   int rc;
   string bucket_index_iname = "motr.rgw.bucket.index." + this->get_bucket()->get_name();
+  int max = 1000;
+  vector<string> keys(max);
+  vector<bufferlist> vals(max);
+  bufferlist bl;
+  bufferlist::const_iterator iter;
 
   if (this->get_bucket()->get_info().versioning_status() == BUCKET_VERSIONED ||
       this->get_bucket()->get_info().versioning_status() == BUCKET_SUSPENDED) {
     
-    ldpp_dout(dpp, 20) << "versioned bucket!" << dendl;
-    int max = 1000;
-    vector<string> keys(max);
-    vector<bufferlist> vals(max);
+    ldpp_dout(dpp, 20) << __func__ << ": versioned bucket!" << dendl;
     keys[0] = this->get_name();
-    ldpp_dout(dpp, 20) << "get all versions (max == 1000)" << dendl;
     rc = store->next_query_by_name(bucket_index_iname, keys, vals);
     if (rc < 0) {
       ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
       return rc;
     }
 
-    bool found = false; 
+    rc = -ENOENT;
     for (const auto& bl: vals) {
       if (bl.length() == 0)
         break;
 
       rgw_bucket_dir_entry ent_to_check;
-      auto iter = bl.cbegin();
+      iter = bl.cbegin();
       ent_to_check.decode(iter);
       if (ent_to_check.is_current()) {
-        ldpp_dout(dpp, 20) << "found current version!" << dendl;
-        found = true;
+        ldpp_dout(dpp, 20) << __func__ << ": found current version!" << dendl;
         ent = ent_to_check;
-	break;
+        rc = 0;
+        break;
       }
     }
-    if (found)
-      return 0;
-    else 
-      return -ENOENT;
   } else {
-    bufferlist bl;
-    ldpp_dout(dpp, 20) << "non-versioned bucket!" << dendl;
+    ldpp_dout(dpp, 20) << __func__ << ": non-versioned bucket!" << dendl;
     rc = this->store->do_idx_op_by_name(bucket_index_iname,
                                         M0_IC_GET, this->get_key().to_str(), bl);
     if (rc < 0) {
-      ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index." << dendl;
+      ldpp_dout(dpp, 0) << "ERROR: failed to get object's entry from bucket index: rc="
+                        << rc << dendl;
       return rc;
     }
     bufferlist& blr = bl;
-    auto iter = blr.cbegin();
+    iter = blr.cbegin();
     ent.decode(iter);
-    return 0;
   }
+
+  if (rc == 0) {
+    sal::Attrs dummy;
+    decode(dummy, iter);
+    meta.decode(iter);
+    ldpp_dout(dpp, 20) << __func__ << ": lid=0x" << std::hex << meta.layout_id << dendl;
+  } else
+    ldpp_dout(dpp, 0) << __func__ << ": rc=" << rc << dendl;
+
+  return rc;
 }
 
 int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
@@ -1614,6 +1622,11 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
     if (!ent.is_current())
       continue;
 
+    rgw::sal::Attrs attrs;
+    decode(attrs, iter);
+    MotrObject::Meta meta;
+    meta.decode(iter);
+
     ent.flags = rgw_bucket_dir_entry::FLAG_VER;
     string key;
     if (ent.key.instance.empty())
@@ -1626,6 +1639,9 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
     ldpp_dout(dpp, 20) << "update one version, key = " << key << dendl;
     bufferlist ent_bl;
     ent.encode(ent_bl);
+    encode(attrs, ent_bl);
+    meta.encode(ent_bl);
+
     rc = store->do_idx_op_by_name(bucket_index_iname,
                                   M0_IC_PUT, key, ent_bl);
     if (rc < 0)
@@ -1680,6 +1696,7 @@ int MotrObject::get_part_objs(const DoutPrefixProvider* dpp,
       mobj->part_off = off;
       mobj->part_size = part_size;
       mobj->part_num = part_num;
+      mobj->meta = mmpart->meta;
 
       part_objs.emplace(part_num, std::move(mobj));
 
@@ -1763,7 +1780,8 @@ unsigned MotrObject::get_optimal_bs(unsigned len)
                               &mobj->ob_attr.oa_pver);
   M0_ASSERT(pver != NULL);
   struct m0_pdclust_attr *pa = &pver->pv_attr;
-  unsigned unit_sz = m0_obj_layout_id_to_unit_size(layout_id);
+  uint64_t lid = M0_OBJ_LAYOUT_ID(meta.layout_id);
+  unsigned unit_sz = m0_obj_layout_id_to_unit_size(lid);
   unsigned grp_sz  = unit_sz * pa->pa_N;
 
   // bs should be max 4-times pool-width deep counting by 1MB units, or
@@ -1794,11 +1812,8 @@ void MotrAtomicWriter::cleanup()
   m0_indexvec_free(&ext);
   m0_bufvec_free(&attr);
   m0_bufvec_free2(&buf);
-
   acc_bl.clear();
-
-  if (obj.is_opened())
-    obj.close_mobj();
+  obj.close_mobj();
 }
 
 unsigned MotrAtomicWriter::populate_bvec(unsigned len, bufferlist::iterator &bi)
@@ -1950,7 +1965,7 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   bool is_versioned = obj.get_key().have_instance();
   if (is_versioned)
     ent.flags = rgw_bucket_dir_entry::FLAG_VER | rgw_bucket_dir_entry::FLAG_CURRENT;
-  ldpp_dout(dpp, 20) << "MotrAtomicWriter::complete(): key=" << obj.get_key().to_str()
+  ldpp_dout(dpp, 20) << __func__ << ": key=" << obj.get_key().to_str()
                     << " etag: " << etag << " user_data=" << user_data << dendl;
   if (user_data)
     ent.meta.user_data = *user_data;
@@ -1969,7 +1984,9 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
     }
   }
   encode(attrs, bl);
-
+  obj.meta.encode(bl);
+  ldpp_dout(dpp, 20) << __func__ << ": lid=0x" << std::hex << obj.meta.layout_id
+                                                           << dendl;
   if (is_versioned) {
     // get the list of all versioned objects with the same key and
     // unset their FLAG_CURRENT later, if do_idx_op_by_name() is successful.
@@ -2191,6 +2208,10 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     RGWUploadPartInfo info;
     auto iter = bl.cbegin();
     info.decode(iter);
+    rgw::sal::Attrs attrs_dummy;
+    decode(attrs_dummy, iter);
+    MotrObject::Meta meta;
+    meta.decode(iter);
 
     ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): part_num=" << info.num
                                              << " part_size=" << info.size << dendl;
@@ -2199,7 +2220,7 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
 
     if ((int)info.num > marker) {
       last_num = info.num;
-      parts.emplace(info.num, std::make_unique<MotrMultipartPart>(info));
+      parts.emplace(info.num, std::make_unique<MotrMultipartPart>(info, meta));
     }
 
     part_cnt++;
@@ -2273,8 +2294,8 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
       MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
       RGWUploadPartInfo *part = &mmpart->info;
 
-      ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): part_size=" << part->size << dendl;
-      uint64_t part_size = part->size;
+      uint64_t part_size = part->accounted_size;
+      ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): part_size=" << part_size << dendl;
       if (handled_parts < (int)part_etags.size() - 1 &&
           part_size < min_part_size) {
         rc = -ERR_TOO_SMALL;
@@ -2297,8 +2318,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
         return rc;
       }
 
-      hex_to_buf(part->etag.c_str(), petag,
-		CEPH_CRYPTO_MD5_DIGESTSIZE);
+      hex_to_buf(part->etag.c_str(), petag, CEPH_CRYPTO_MD5_DIGESTSIZE);
       hash.Update((const unsigned char *)petag, sizeof(petag));
       ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): calc etag " << dendl;
 
@@ -2358,7 +2378,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
       src_obj.key.get_index_key(&remove_key);
       remove_objs.push_back(remove_key);
 
-      off += part->size;
+      off += part_size;
       accounted_size += part->accounted_size;
       ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): off=" << off << ", accounted_size = " << accounted_size << dendl;
     }
@@ -2410,6 +2430,10 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   ent.meta.mtime = ceph::real_clock::now();
   ent.meta.etag = etag;
   ent.encode(update_bl);
+  encode(attrs, update_bl);
+  MotrObject::Meta meta_dummy;
+  meta_dummy.encode(update_bl);
+
   string bucket_index_iname = "motr.rgw.bucket.index." + meta_obj->get_bucket()->get_name();
   ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): target_obj name=" << target_obj->get_name()
                                   << " target_obj oid=" << target_obj->get_oid() << dendl;
@@ -2561,6 +2585,8 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
     return rc;
   }
   encode(info, bl);
+  encode(attrs, bl);
+  part_obj->meta.encode(bl);
 
   string p = "part.";
   char buf[32];

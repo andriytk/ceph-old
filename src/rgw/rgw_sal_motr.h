@@ -379,7 +379,6 @@ class MotrObject : public Object {
     RGWObjState *state;
 
     RGWObjCategory category;
-    uint64_t layout_id;
 
     // If this object is pat of a multipart uploaded one.
     // TODO: do it in another class? MotrPartObject : public MotrObject
@@ -389,8 +388,33 @@ class MotrObject : public Object {
 
   public:
 
-    struct m0_obj *mobj = NULL;
-    struct m0_uint128 fid;
+    // motr object metadata stored in index
+    struct Meta {
+      struct m0_fid pver = {};
+      uint64_t layout_id = 0;
+
+      void encode(bufferlist& bl) const
+      {
+        ENCODE_START(3, 3, bl);
+        encode(pver.f_container, bl);
+        encode(pver.f_key, bl);
+        encode(layout_id, bl);
+        ENCODE_FINISH(bl);
+      }
+
+      void decode(bufferlist::const_iterator& bl)
+      {
+        DECODE_START(3, bl);
+        decode(pver.f_container, bl);
+        decode(pver.f_key, bl);
+        decode(layout_id, bl);
+        DECODE_FINISH(bl);
+      }
+    };
+
+    struct m0_obj     *mobj = NULL;
+    struct m0_uint128  fid;
+    Meta               meta;
 
     struct MotrReadOp : public ReadOp {
       private:
@@ -640,7 +664,7 @@ public:
 // related metadata: (1) Bucket multipart index (bucket_nnn_multipart_index)
 // which contains metadata that answers questions such as which objects have
 // started  multipart upload and its upload id. This index is created during
-// bucket creation. (2) Bbject part index (object_nnn_part_index) which stores
+// bucket creation. (2) Object part index (object_nnn_part_index) which stores
 // metadata of a part's details (size, pvid, oid...). This index is created in
 // MotrMultipartUpload::init(). (3) Extended metadata index
 // (bucket_nnn_extended_metadata): once parts has been uploaded and their
@@ -665,7 +689,10 @@ protected:
   RGWUploadPartInfo info;
 
 public:
-  MotrMultipartPart(RGWUploadPartInfo _info) : info(_info) {}
+  MotrObject::Meta  meta;
+
+  MotrMultipartPart(RGWUploadPartInfo _info, MotrObject::Meta _meta) :
+    info(_info), meta(_meta) {}
   virtual ~MotrMultipartPart() = default;
 
   virtual uint32_t get_num() { return info.num; }
