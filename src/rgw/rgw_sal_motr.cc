@@ -1398,7 +1398,6 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
   unsigned bs, left;
   struct m0_op *op;
   char *start, *p;
-  bufferlist tail;
   struct m0_bufvec buf;
   struct m0_bufvec attr;
   struct m0_indexvec ext;
@@ -1424,8 +1423,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& data, uin
     if (left < bs) {
       data.append_zero(bs - left);
       left = bs;
-      data.splice(p - start, bs, &tail);
-      p = tail.c_str();
+      p = data.c_str();
     }
     buf.ov_buf[0] = p;
     buf.ov_vec.v_count[0] = bs;
@@ -2294,8 +2292,8 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
       MotrMultipartPart *mmpart = static_cast<MotrMultipartPart *>(mpart);
       RGWUploadPartInfo *part = &mmpart->info;
 
-      ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): part_size=" << part->size << dendl;
-      uint64_t part_size = part->size;
+      uint64_t part_size = part->accounted_size;
+      ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): part_size=" << part_size << dendl;
       if (handled_parts < (int)part_etags.size() - 1 &&
           part_size < min_part_size) {
         rc = -ERR_TOO_SMALL;
@@ -2318,8 +2316,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
         return rc;
       }
 
-      hex_to_buf(part->etag.c_str(), petag,
-		CEPH_CRYPTO_MD5_DIGESTSIZE);
+      hex_to_buf(part->etag.c_str(), petag, CEPH_CRYPTO_MD5_DIGESTSIZE);
       hash.Update((const unsigned char *)petag, sizeof(petag));
       ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): calc etag " << dendl;
 
@@ -2379,7 +2376,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
       src_obj.key.get_index_key(&remove_key);
       remove_objs.push_back(remove_key);
 
-      off += part->size;
+      off += part_size;
       accounted_size += part->accounted_size;
       ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): off=" << off << ", accounted_size = " << accounted_size << dendl;
     }
